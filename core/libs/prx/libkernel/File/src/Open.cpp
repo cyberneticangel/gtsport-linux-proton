@@ -2,6 +2,14 @@
 #ifndef _WIN32
 #include <dlfcn.h>
 #endif
+#ifndef _WIN32
+// The shadGT renderer's export, looked up in libSceVideoOut.prx itself as on Windows: shadGT's
+// other libraries export some of the same names (RytyGpuHideSplashScreen is in all eight).
+static void* RendererSymbol(const char* name) {
+    void* renderer = dlopen("libSceVideoOut.prx", RTLD_LAZY | RTLD_NOLOAD);
+    return renderer != nullptr ? dlsym(renderer, name) : nullptr;
+}
+#endif
 #include "prx/libkernel/File/include/NativeStat.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libkernel/File/include/File.hpp"
@@ -111,7 +119,7 @@ void PrepareGuestWrite(void* buffer, std::size_t bytes) {
     if (invalidate != nullptr && buffer != nullptr && bytes != 0) invalidate(reinterpret_cast<std::uint64_t>(buffer), bytes);
 #else
     using RangeFunction = void (*)(std::uint64_t, std::uint64_t);
-    static const auto invalidate = reinterpret_cast<RangeFunction>(dlsym(RTLD_DEFAULT, "RytyGpuInvalidateMemory"));
+    static const auto invalidate = reinterpret_cast<RangeFunction>(RendererSymbol("RytyGpuInvalidateMemory"));
     if (invalidate != nullptr && buffer != nullptr && bytes != 0) invalidate(reinterpret_cast<std::uint64_t>(buffer), bytes);
 #endif
 }

@@ -2,6 +2,14 @@
 #ifndef _WIN32
 #include <dlfcn.h>
 #endif
+#ifndef _WIN32
+// The shadGT renderer's export, looked up in libSceVideoOut.prx itself as on Windows: shadGT's
+// other libraries export some of the same names (RytyGpuHideSplashScreen is in all eight).
+static void* RendererSymbol(const char* name) {
+    void* renderer = dlopen("libSceVideoOut.prx", RTLD_LAZY | RTLD_NOLOAD);
+    return renderer != nullptr ? dlsym(renderer, name) : nullptr;
+}
+#endif
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -263,6 +271,16 @@ public:
 
     PhysicalBacking(const PhysicalBacking&) = delete;
     PhysicalBacking& operator=(const PhysicalBacking&) = delete;
+
+#ifndef _WIN32
+    // Reads or writes the backing file directly: every mapping of these bytes sees the change,
+    // whatever its protection (the renderer's page tracking makes mappings read-only).
+    bool Copy(std::uint64_t offset, void* dest, const void* source, std::size_t bytes) const {
+        const auto done = dest != nullptr ? ::pread(file, dest, bytes, static_cast<off_t>(offset))
+                                          : ::pwrite(file, source, bytes, static_cast<off_t>(offset));
+        return done == static_cast<ssize_t>(bytes);
+    }
+#endif
 
     void Map(std::uintptr_t address, std::size_t bytes, std::uint64_t offset, int protection) const {
 #ifdef _WIN32
@@ -543,7 +561,7 @@ void NotifyRenderer(const char* name, const void* addr, size_t len) {
     // Linux: the renderer's exports are in the process's global scope.
     using RangeFunction = void (*)(std::uint64_t, std::uint64_t);
     if (addr == nullptr || len == 0) return;
-    if (const auto function = reinterpret_cast<RangeFunction>(dlsym(RTLD_DEFAULT, name))) {
+    if (const auto function = reinterpret_cast<RangeFunction>(RendererSymbol(name))) {
         function(reinterpret_cast<std::uint64_t>(addr), len);
     }
 #endif
@@ -758,6 +776,34 @@ bool GuestProtection(uintptr_t addr, int* prot) {
     *prot = containing->second.prot;
     return true;
 }
+
+#ifndef _WIN32
+// Linux counterpart of the Windows alias views the renderer writes through (GuestArenaMapAlias):
+// copies between host memory and guest direct memory through the backing files, so protected
+// (read-only shared) mappings need no protection change. dest != nullptr reads, otherwise writes.
+// False when part of the range is not direct memory.
+extern "C" bool RytyDirectMemoryCopy_nid_no_patch(std::uint64_t address, void* dest, const void* source, std::uint64_t size) {
+    std::lock_guard lock(g_directLock);
+    auto* out = static_cast<std::uint8_t*>(dest);
+    const auto* in = static_cast<const std::uint8_t*>(source);
+    while (size != 0) {
+        const auto next = g_directMappings.upper_bound(address);
+        if (next == g_directMappings.begin()) return false;
+        const auto mapping = std::prev(next);
+        if (address >= mapping->second.end) return false;
+        const std::uint64_t phys = mapping->second.phys + (address - mapping->first);
+        const auto page = g_physPages.find(phys & ~static_cast<std::uint64_t>(PS5_PAGE_SIZE - 1));
+        if (page == g_physPages.end()) return false;
+        const std::uint64_t within = phys & (PS5_PAGE_SIZE - 1);
+        const std::uint64_t chunk = std::min<std::uint64_t>({size, PS5_PAGE_SIZE - within, mapping->second.end - address});
+        if (!page->second.backing->Copy(page->second.offset + within, out, in, chunk)) return false;
+        address += chunk;
+        size -= chunk;
+        if (out != nullptr) out += chunk; else in += chunk;
+    }
+    return true;
+}
+#endif
 
 bool QueryDirectMapping(std::uintptr_t address, std::uintptr_t* start, std::uintptr_t* end, std::uint64_t* offset, int* memoryType) {
     std::lock_guard lock(g_directLock);

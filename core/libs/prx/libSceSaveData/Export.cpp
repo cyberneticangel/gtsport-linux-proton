@@ -4,6 +4,14 @@
 #ifndef _WIN32
 #include <dlfcn.h>
 #endif
+#ifndef _WIN32
+// The shadGT renderer's export, looked up in libSceVideoOut.prx itself as on Windows: shadGT's
+// other libraries export some of the same names (RytyGpuHideSplashScreen is in all eight).
+static void* RendererSymbol(const char* name) {
+    void* renderer = dlopen("libSceVideoOut.prx", RTLD_LAZY | RTLD_NOLOAD);
+    return renderer != nullptr ? dlsym(renderer, name) : nullptr;
+}
+#endif
 #include <cstdlib>
 #ifdef _WIN32
 #include <windows.h>
@@ -138,7 +146,7 @@ static void WaitForBootScreen() {
 #else
         // Linux: the renderer is in the same process; poll its flag (RytyGpuFirstDrawDone).
         using DoneFn = bool (*)();
-        const auto done = reinterpret_cast<DoneFn>(dlsym(RTLD_DEFAULT, "RytyGpuFirstDrawDone"));
+        const auto done = reinterpret_cast<DoneFn>(RendererSymbol("RytyGpuFirstDrawDone"));
         if (done == nullptr) return;
         const auto start = std::chrono::steady_clock::now();
         bool drawn = false;

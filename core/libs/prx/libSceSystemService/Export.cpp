@@ -2,6 +2,14 @@
 #ifndef _WIN32
 #include <dlfcn.h>
 #endif
+#ifndef _WIN32
+// The shadGT renderer's export, looked up in libSceVideoOut.prx itself as on Windows: shadGT's
+// other libraries export some of the same names (RytyGpuHideSplashScreen is in all eight).
+static void* RendererSymbol(const char* name) {
+    void* renderer = dlopen("libSceVideoOut.prx", RTLD_LAZY | RTLD_NOLOAD);
+    return renderer != nullptr ? dlsym(renderer, name) : nullptr;
+}
+#endif
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
@@ -104,7 +112,7 @@ int APS5_VABI sceSystemServiceHideSplashScreen(void) {
     }
 #else
     using HideFunction = void (*)();
-    if (const auto hide = reinterpret_cast<HideFunction>(dlsym(RTLD_DEFAULT, "RytyGpuHideSplashScreen"))) {
+    if (const auto hide = reinterpret_cast<HideFunction>(RendererSymbol("RytyGpuHideSplashScreen"))) {
         hide();
     }
 #endif
