@@ -1,5 +1,6 @@
 // RyGT loader: sets up Gran Turismo Sport from the player's own dump, firmware modules and fonts,
-// then starts it. Built with build.cmd (C# for .NET Framework 4.x, which Windows includes).
+// then starts it. Built with build.cmd (C# for .NET Framework 4.x, which Windows includes), or with
+// build.sh and Mono on Linux; it also runs under Proton (wine-mono).
 // SPDX-License-Identifier: GPL-2.0-only
 
 using System;
@@ -33,6 +34,25 @@ namespace RyGT
         public static extern int D3D11CreateDevice(IntPtr adapter, int driverType, IntPtr software,
             uint flags, IntPtr featureLevels, uint featureLevelsCount, uint sdkVersion,
             out IntPtr device, out int featureLevel, out IntPtr immediateContext);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+        static extern IntPtr GetModuleHandle(string module);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Ansi)]
+        static extern IntPtr GetProcAddress(IntPtr module, string name);
+
+        /// Running under Wine or Proton (Linux): ntdll exports wine_get_version there only.
+        public static readonly bool Wine = DetectWine();
+
+        static bool DetectWine()
+        {
+            try
+            {
+                IntPtr ntdll = GetModuleHandle("ntdll.dll");
+                return ntdll != IntPtr.Zero && GetProcAddress(ntdll, "wine_get_version") != IntPtr.Zero;
+            }
+            catch { return false; }
+        }
     }
 
     /// Dark colors for the loader window.
@@ -449,7 +469,7 @@ namespace RyGT
             var title = new Label { Text = "ryGT", AutoSize = true, BackColor = Color.Transparent, Font = new Font("Segoe UI Semibold", 22f), Margin = new Padding(0, 0, 0, 0) };
             var subtitle = new Label
             {
-                Text = "Gran Turismo Sport on Windows. Pick your own decrypted dump (CUSA03220), its 1.69 update, " +
+                Text = "Gran Turismo Sport on Windows. Pick your own decrypted dump (CUSA03220 or CUSA02168), its 1.69 update, " +
                        "your PS4 firmware's system modules and fonts; Set up converts the game, Play starts it.",
                 AutoSize = true, MaximumSize = new Size(1160, 0), BackColor = Color.Transparent, Margin = new Padding(2, 0, 0, 12)
             };
@@ -463,7 +483,7 @@ namespace RyGT
             fileTable.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             fileTable.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             files.Controls.Add(fileTable);
-            game = AddRow(fileTable, 0, "Game (CUSA03220)", settings.Game);
+            game = AddRow(fileTable, 0, "Game (CUSA03220/CUSA02168)", settings.Game);
             update = AddRow(fileTable, 1, "Update 1.69 (if separate)", settings.Update);
             modules = AddRow(fileTable, 2, "System modules", settings.Modules);
             fonts = AddRow(fileTable, 3, "Fonts", settings.Fonts);
@@ -1205,7 +1225,7 @@ namespace RyGT
             string baseDir = settings.Game, updateDir = settings.Update;
             if (!Directory.Exists(baseDir)) throw new Exception("Pick the game folder (the one holding gt00.vol and eboot.bin).");
             if (!File.Exists(Path.Combine(baseDir, "gt00.vol")))
-                throw new Exception("The game folder has no gt00.vol. Pick the base game folder of CUSA03220.");
+                throw new Exception("The game folder has no gt00.vol. Pick the base game folder (CUSA03220 or CUSA02168).");
             if (updateDir.Length > 0 && !Directory.Exists(updateDir)) throw new Exception("The update folder does not exist.");
             if (updateDir.Length == 0) updateDir = null;
             string gameDir = updateDir ?? baseDir; // the newest executable, modules and data index
@@ -1508,6 +1528,13 @@ namespace RyGT
 
         void LinkGameFiles(string baseDir, string updateDir)
         {
+            // tools/linux/rygt-proton.sh makes app0 with real Linux symlinks, which every Proton
+            // follows (Proton 10 and older cannot follow the links Wine makes itself).
+            if (Environment.GetEnvironmentVariable("RYGT_APP0_LINKED") == "1")
+            {
+                Log("app0 was linked by rygt-proton.sh.");
+                return;
+            }
             string app0 = Path.Combine(root, "app0");
             var files = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             var dirs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -1531,9 +1558,11 @@ namespace RyGT
                 string target = Path.Combine(app0, pair.Key);
                 if (File.Exists(target)) File.Delete(target);
                 if (Native.CreateHardLink(target, pair.Value, IntPtr.Zero)) { linked++; continue; }
-                if (Native.CreateSymbolicLink(target, pair.Value, 2)) { linked++; continue; } // needs Developer Mode
-                throw new Exception("Could not link " + pair.Value + ". Put the RyGT folder on the same drive as the game, " +
-                                    "or turn on Developer Mode in Windows settings.");
+                // Needs Developer Mode; under Proton 10 and older Wine makes links it cannot open.
+                if (Native.CreateSymbolicLink(target, pair.Value, 2) && (!Native.Wine || File.Exists(target))) { linked++; continue; }
+                throw new Exception("Could not link " + pair.Value + (Native.Wine
+                    ? ". Use Proton Experimental, or Set up with tools/linux/rygt-proton.sh."
+                    : ". Put the RyGT folder on the same drive as the game, or turn on Developer Mode in Windows settings."));
             }
             foreach (var pair in dirs)
             {
@@ -1542,7 +1571,9 @@ namespace RyGT
                 var info = new ProcessStartInfo("cmd.exe", "/c mklink /J \"" + target + "\" \"" + pair.Value + "\"")
                 { UseShellExecute = false, CreateNoWindow = true };
                 using (var process = Process.Start(info)) process.WaitForExit();
-                if (!Directory.Exists(target)) throw new Exception("Could not link the folder " + pair.Value + ".");
+                if (!Directory.Exists(target)) throw new Exception("Could not link the folder " + pair.Value + (Native.Wine
+                    ? ". Proton 10 and older cannot; use Proton Experimental, or Set up with tools/linux/rygt-proton.sh."
+                    : "."));
             }
             Log("Linked " + linked + " game files and " + dirs.Count + " folders into app0.");
         }

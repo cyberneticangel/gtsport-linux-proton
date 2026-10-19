@@ -23,7 +23,8 @@ Unzip a release on the same drive as your game dump, run `RyGT.exe`, pick the ga
 press **Set up** and **Play**. Set up also gives `GTSport.exe` the ryGT icon and makes it a Windows
 (GUI) program, so after that you can also open `GTSport.exe` directly: the runtime and renderer
 default to the settings GT Sport needs, and the game writes `stdout.log` and `stderr.log` itself.
-The loader's source is in [loader](../../loader) (build it with `loader/build.cmd`).
+The loader's source is in [loader](../../loader) (build it with `loader/build.cmd`, or `loader/build.sh`
+with Mono on Linux). On Linux, see [LINUX.md](LINUX.md).
 
 Options: **Start in fullscreen** (borderless, on the window's display), the splash screen, FPS
 counter, Discord and upscaling (below).

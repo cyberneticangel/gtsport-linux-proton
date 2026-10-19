@@ -1,0 +1,93 @@
+diff --git a/LibOrbisPkg.Core/LibOrbisPkg.Core.csproj b/LibOrbisPkg.Core/LibOrbisPkg.Core.csproj
+index 5f0fe49..7682ab6 100644
+--- a/LibOrbisPkg.Core/LibOrbisPkg.Core.csproj
++++ b/LibOrbisPkg.Core/LibOrbisPkg.Core.csproj
+@@ -1,7 +1,7 @@
+ ﻿<Project Sdk="Microsoft.NET.Sdk">
+ 
+   <PropertyGroup>
+-    <TargetFramework>netcoreapp3.0</TargetFramework>
++    <TargetFramework>net8.0</TargetFramework>
+     <RootNamespace>LibOrbisPkg</RootNamespace>
+     <LangVersion>7.3</LangVersion>
+     <Platforms>AnyCPU</Platforms>
+diff --git a/LibOrbisPkg/PFS/PFSCReader.cs b/LibOrbisPkg/PFS/PFSCReader.cs
+index 12c6c1b..cb1283e 100644
+--- a/LibOrbisPkg/PFS/PFSCReader.cs
++++ b/LibOrbisPkg/PFS/PFSCReader.cs
+@@ -84,7 +84,12 @@ namespace LibOrbisPkg.PFS
+         using (var bufStream = new MemoryStream(sectorBuf))
+         using (var ds = new DeflateStream(bufStream, CompressionMode.Decompress))
+         {
+-          ds.Read(output, 0, hdr.BlockSz);
++          // Stream.Read may return less than asked for (DeflateStream does since .NET 6): read the whole block.
++          int done = 0, n;
++          while (done < hdr.BlockSz && (n = ds.Read(output, done, hdr.BlockSz - done)) > 0)
++            done += n;
++          if (done < hdr.BlockSz)
++            throw new InvalidDataException($"PFSC block {idx} inflated to {done} of {hdr.BlockSz} bytes");
+         }
+       }
+     }
+diff --git a/PkgTool.Core/PkgTool.Core.csproj b/PkgTool.Core/PkgTool.Core.csproj
+index 10e4e0b..147a94f 100644
+--- a/PkgTool.Core/PkgTool.Core.csproj
++++ b/PkgTool.Core/PkgTool.Core.csproj
+@@ -2,7 +2,7 @@
+ 
+   <PropertyGroup>
+     <OutputType>Exe</OutputType>
+-    <TargetFramework>netcoreapp3.0</TargetFramework>
++    <TargetFramework>net8.0</TargetFramework>
+     <StartupObject>PkgTool.Program</StartupObject>
+     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+diff --git a/PkgTool/Program.cs b/PkgTool/Program.cs
+index 7068d7c..04ed421 100644
+--- a/PkgTool/Program.cs
++++ b/PkgTool/Program.cs
+@@ -111,7 +111,7 @@ namespace PkgTool
+           var passcode = optionals["passcode"];
+           Pkg pkg;
+ 
+-          var mmf = MemoryMappedFile.CreateFromFile(pkgPath);
++          var mmf = MemoryMappedFile.CreateFromFile(pkgPath, System.IO.FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
+           using (var s = mmf.CreateViewStream(0, 0, MemoryMappedFileAccess.Read))
+           {
+             pkg = new PkgReader(s).ReadPkg();
+@@ -120,7 +120,7 @@ namespace PkgTool
+           var outerPfsOffset = (long)pkg.Header.pfs_image_offset;
+           using(var acc = mmf.CreateViewAccessor(outerPfsOffset, (long)pkg.Header.pfs_image_size, MemoryMappedFileAccess.Read))
+           {
+-            var outerPfs = new PfsReader(acc, pkg.Header.pfs_flags, ekpfs, optionals["xts_tweak"]?.FromHexCompact(), optionals["xts_data"]?.FromHexCompact());
++            var outerPfs = new PfsReader(acc, pkg.Header.pfs_flags ^ Convert.ToUInt64(Environment.GetEnvironmentVariable("PKGTOOL_PFS_FLAGS_XOR") ?? "0", 16), ekpfs, optionals["xts_tweak"]?.FromHexCompact(), optionals["xts_data"]?.FromHexCompact());
+             var inner = new PfsReader(new PFSCReader(outerPfs.GetFile("pfs_image.dat").GetView()));
+             ExtractInParallel(inner, outPath, flags["verbose"]);
+           }
+@@ -133,7 +133,7 @@ namespace PkgTool
+         {
+           var pfsPath = args[1];
+           var outPath = args[2];
+-          using(var mmf = MemoryMappedFile.CreateFromFile(pfsPath))
++          using(var mmf = MemoryMappedFile.CreateFromFile(pfsPath, System.IO.FileMode.Open, null, 0, MemoryMappedFileAccess.Read))
+           using(var acc = mmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read))
+           {
+             var pfs = new PfsReader(acc);
+@@ -151,7 +151,7 @@ namespace PkgTool
+           var passcode = optionals["passcode"];
+ 
+           Pkg pkg;
+-          var mmf = MemoryMappedFile.CreateFromFile(pkgPath);
++          var mmf = MemoryMappedFile.CreateFromFile(pkgPath, System.IO.FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
+           using (var s = mmf.CreateViewStream(0, 0, MemoryMappedFileAccess.Read))
+           {
+             pkg = new PkgReader(s).ReadPkg();
+@@ -160,7 +160,7 @@ namespace PkgTool
+           var outerPfsOffset = (long)pkg.Header.pfs_image_offset;
+           using(var acc = mmf.CreateViewAccessor(outerPfsOffset, (long)pkg.Header.pfs_image_size, MemoryMappedFileAccess.Read))
+           {
+-            var outerPfs = new PfsReader(acc, pkg.Header.pfs_flags, ekpfs, optionals["xts_tweak"]?.FromHexCompact(), optionals["xts_data"]?.FromHexCompact());
++            var outerPfs = new PfsReader(acc, pkg.Header.pfs_flags ^ Convert.ToUInt64(Environment.GetEnvironmentVariable("PKGTOOL_PFS_FLAGS_XOR") ?? "0", 16), ekpfs, optionals["xts_tweak"]?.FromHexCompact(), optionals["xts_data"]?.FromHexCompact());
+             var inner = outerPfs.GetFile("pfs_image.dat");
+             using(var v = inner.GetView())
+             using(var d = switches["compressed"] ? v : new PFSCReader(v))

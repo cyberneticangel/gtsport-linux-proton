@@ -14,7 +14,7 @@
 
 ## Build and test
 
-Toolchains are listed in the [README](README.md#build).
+Toolchains are listed in the [README](README.upstream.md#building).
 
 ```
 cmake --preset linux-release          # or windows-release in an MSYS2 UCRT64 shell
