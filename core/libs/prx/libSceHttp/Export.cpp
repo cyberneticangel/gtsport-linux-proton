@@ -394,7 +394,7 @@ int APS5_VABI sceHttpRedirectCacheFlush() { return ERROR_NETWORK; }
 int APS5_VABI sceHttpRemoveRequestHeader() { return ERROR_NETWORK; }
 int APS5_VABI sceHttpRequestGetAllHeaders() { return ERROR_NETWORK; }
 int APS5_VABI sceHttpsDisableOptionPrivate() { return ERROR_NETWORK; }
-int APS5_VABI sceHttpsEnableOption() { return ERROR_NETWORK; }
+int APS5_VABI sceHttpsEnableOption() { return 0; } // local HTTPS setup: succeeds offline (GT Sport waits at boot otherwise)
 int APS5_VABI sceHttpsEnableOptionPrivate() { return ERROR_NETWORK; }
 int APS5_VABI sceHttpSetAcceptEncodingGZIPEnabled() { return ERROR_NETWORK; }
 int APS5_VABI sceHttpSetAuthInfoCallback() { return ERROR_NETWORK; }
@@ -402,7 +402,7 @@ int APS5_VABI sceHttpSetCookieEnabled() { return ERROR_NETWORK; }
 int APS5_VABI sceHttpSetCookieMaxNum() { return ERROR_NETWORK; }
 int APS5_VABI sceHttpSetCookieMaxNumPerDomain() { return ERROR_NETWORK; }
 int APS5_VABI sceHttpSetCookieMaxSize() { return ERROR_NETWORK; }
-int APS5_VABI sceHttpSetCookieRecvCallback() { return ERROR_NETWORK; }
+int APS5_VABI sceHttpSetCookieRecvCallback() { return 0; } // local HTTPS setup: succeeds offline (GT Sport waits at boot otherwise)
 int APS5_VABI sceHttpSetCookieSendCallback() { return ERROR_NETWORK; }
 int APS5_VABI sceHttpSetCookieTotalMaxSize() { return ERROR_NETWORK; }
 int APS5_VABI sceHttpSetDefaultAcceptEncodingGZIPEnabled() { return ERROR_NETWORK; }
@@ -421,7 +421,7 @@ int APS5_VABI sceHttpSetSocketCreationCallback() { return ERROR_NETWORK; }
 int APS5_VABI sceHttpsFreeCaList() { return ERROR_NETWORK; }
 int APS5_VABI sceHttpsGetCaList() { return ERROR_NETWORK; }
 int APS5_VABI sceHttpsGetSslError() { return ERROR_NETWORK; }
-int APS5_VABI sceHttpsLoadCert() { return ERROR_NETWORK; }
+int APS5_VABI sceHttpsLoadCert() { return 0; } // local HTTPS setup: succeeds offline (GT Sport waits at boot otherwise)
 int APS5_VABI sceHttpsSetSslVersion() { return ERROR_NETWORK; }
 int APS5_VABI sceHttpsUnloadCert() { return ERROR_NETWORK; }
 int APS5_VABI sceHttpTerm() { return ERROR_NETWORK; }
