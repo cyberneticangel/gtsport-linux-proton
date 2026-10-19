@@ -29,10 +29,12 @@
 #include <type_traits>
 
 namespace {
+#ifdef _WIN32
 const wchar_t* compatEnvWide(const wchar_t* newName, const wchar_t* legacyName) {
     if (const wchar_t* value = _wgetenv(newName)) return value;
     return _wgetenv(legacyName);
 }
+#endif
 const char* compatEnv(const char* newName, const char* legacyName) {
     if (const char* value = std::getenv(newName)) return value;
     return std::getenv(legacyName);

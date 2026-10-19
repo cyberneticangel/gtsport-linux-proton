@@ -192,29 +192,6 @@ static void PruneSymbols(AdhocFile file, AdhocSymbolMap map)
     }
 }
 
-// TITLE_ID from the game's sce_sys\param.sfo (update first), e.g. CUSA03220 (US) or CUSA02168
-// (Europe). The renderer names its shader caches after it; CUSA03220 when no param.sfo is found.
-static string TitleId(params string[] dirs)
-{
-    foreach (var dir in dirs.Where(d => !string.IsNullOrEmpty(d)))
-    {
-        string sfo = Path.Combine(dir, "sce_sys", "param.sfo");
-        if (!File.Exists(sfo)) continue;
-        var d = File.ReadAllBytes(sfo);
-        if (d.Length < 20 || BitConverter.ToUInt32(d, 0) != 0x46535000) continue;
-        int keys = (int)BitConverter.ToUInt32(d, 8), data = (int)BitConverter.ToUInt32(d, 12), count = (int)BitConverter.ToUInt32(d, 16);
-        for (int i = 0; i < count; i++)
-        {
-            int e = 20 + i * 16, keyOffset = BitConverter.ToUInt16(d, e), length = (int)BitConverter.ToUInt32(d, e + 4);
-            int dataOffset = (int)BitConverter.ToUInt32(d, e + 12), end = keys + keyOffset;
-            while (end < d.Length && d[end] != 0) end++;
-            if (System.Text.Encoding.ASCII.GetString(d, keys + keyOffset, end - keys - keyOffset) == "TITLE_ID")
-                return System.Text.Encoding.ASCII.GetString(d, data + dataOffset, length).TrimEnd('\0');
-        }
-    }
-    return "CUSA03220";
-}
-
 string mode = args[0];
 if (mode == "shaderindex")
 {
@@ -340,13 +317,10 @@ if (mode == "shaderpack")
 if (mode == "shaderprep")
 {
     // shaderprep <game> <update or ""> <shaders.pack> <cache dir>: what Set up does. Writes the
-    // pack's shader settings into <cache dir>\<title>-direct (files already there are kept)
+    // pack's shader settings into <cache dir>\CUSA03220-direct (files already there are kept)
     // and copies each listed program out of the player's own game files into
-    // <cache dir>\<title>-programs; the renderer translates them on the splash screen. <title> is
-    // the game's own title ID (the pack is made with CUSA03220; Europe's CUSA02168 is the same
-    // 1.69 build, and each program is checked against its hash before it is copied).
+    // <cache dir>\CUSA03220-programs; the renderer translates them on the splash screen.
     string game = args[1], update = args[2], cache = args[4];
-    string title = TitleId(update, game);
     using var input = File.OpenRead(args[3]);
     var magic = new byte[8];
     input.ReadExactly(magic);
@@ -356,19 +330,19 @@ if (mode == "shaderprep")
     int count = r.ReadInt32();
     var programs = new List<(ulong hash, string path, long footer)>();
     for (int i = 0; i < count; i++) programs.Add((r.ReadUInt64(), r.ReadString(), r.ReadInt64()));
-    string store = Path.Combine(cache, title + "-direct");
+    string store = Path.Combine(cache, "CUSA03220-direct");
     Directory.CreateDirectory(store);
     int files = r.ReadInt32(), written = 0;
     for (int i = 0; i < files; i++)
     {
         string name = r.ReadString();
         var bytes = r.ReadBytes(r.ReadInt32());
-        string target = name.EndsWith(".else-scope-fix") ? Path.Combine(cache, title + ".else-scope-fix") : Path.Combine(store, name);
+        string target = name.EndsWith(".else-scope-fix") ? Path.Combine(cache, name) : Path.Combine(store, name);
         if (File.Exists(target)) continue;
         File.WriteAllBytes(target, bytes);
         written++;
     }
-    string dir = Path.Combine(cache, title + "-programs");
+    string dir = Path.Combine(cache, "CUSA03220-programs");
     Directory.CreateDirectory(dir);
     var idx = new List<string>();
     if (!string.IsNullOrEmpty(update)) idx.Add(Path.Combine(update, "gt.idx"));

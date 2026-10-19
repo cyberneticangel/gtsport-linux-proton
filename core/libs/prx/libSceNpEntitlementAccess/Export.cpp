@@ -12,6 +12,7 @@
 #include <vector>
 #ifdef _WIN32
 #include <windows.h>
+#endif
 
 namespace {
 const char* compatEnv(const char* newName, const char* legacyName) {
@@ -19,7 +20,6 @@ const char* compatEnv(const char* newName, const char* legacyName) {
     return std::getenv(legacyName);
 }
 }
-#endif
 
 static constexpr int SCE_NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER = static_cast<int>(0x80558003);
 static constexpr int SCE_NP_ENTITLEMENT_ACCESS_ERROR_NOT_FOUND = static_cast<int>(0x80558007);
