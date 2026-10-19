@@ -9,6 +9,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 set -euo pipefail
 
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 folder="${1:-$PWD}"
 [[ $# -gt 0 ]] && shift
 folder="$(cd "$folder" && pwd -P)"
@@ -20,7 +21,6 @@ export LD_LIBRARY_PATH="$folder/libs${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 # AMD GPUs: the direct renderer imports aliases of the game's GPU memory (a memfd), which amdgpu
 # refuses without rygt-userptr.so (see rygt-userptr.c). Natively the aliases are never protected
 # or remapped, so the imports stay valid. RYGT_USERPTR=0 turns it off.
-here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ "${RYGT_USERPTR:-auto}" != 0 ]] && grep -qx 0x1002 /sys/class/drm/card*/device/vendor 2>/dev/null; then
     library="${XDG_DATA_HOME:-$HOME/.local/share}/rygt/rygt-userptr.so"
     if [[ ! -f "$library" || "$here/rygt-userptr.c" -nt "$library" ]]; then
