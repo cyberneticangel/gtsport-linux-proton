@@ -282,6 +282,15 @@ public:
     }
 #endif
 
+#ifndef _WIN32
+    // A second, read-write mapping of [offset, offset + bytes) of the backing, which page
+    // tracking never protects: what the renderer imports for the GPU (Windows alias views).
+    void* MapAlias(std::uint64_t offset, std::size_t bytes) const {
+        void* alias = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, file, static_cast<off_t>(offset));
+        return alias == MAP_FAILED ? nullptr : alias;
+    }
+#endif
+
     void Map(std::uintptr_t address, std::size_t bytes, std::uint64_t offset, int protection) const {
 #ifdef _WIN32
         GuestArena::GuestArenaMap_nid_postfix(reinterpret_cast<void*>(address), bytes, section, offset, WinProtFromPosix(protection));
@@ -802,6 +811,94 @@ extern "C" bool RytyDirectMemoryCopy_nid_no_patch(std::uint64_t address, void* d
         if (out != nullptr) out += chunk; else in += chunk;
     }
     return true;
+}
+#endif
+
+#ifndef _WIN32
+namespace {
+// The run of whole direct-memory pages around address that one backing holds contiguously (one
+// mapping, no change of backing or gap in its offsets): a view the renderer can alias. Caller
+// holds g_directLock.
+bool DirectView(std::uintptr_t address, std::uintptr_t& viewBegin, std::uintptr_t& viewEnd,
+                const PhysicalBacking*& backing, std::uint64_t& backingOffset) {
+    const auto next = g_directMappings.upper_bound(address);
+    if (next == g_directMappings.begin()) return false;
+    const auto mapping = std::prev(next);
+    if (address >= mapping->second.end) return false;
+    constexpr std::uint64_t Page = PS5_PAGE_SIZE;
+    const auto pageOf = [&](std::uintptr_t at) -> const PhysicalPage* {
+        const std::uint64_t phys = mapping->second.phys + (at - mapping->first);
+        const auto page = g_physPages.find(phys & ~(Page - 1));
+        return page == g_physPages.end() ? nullptr : &page->second;
+    };
+    const std::uintptr_t first = mapping->first, last = mapping->second.end;
+    if ((first & (Page - 1)) != 0 || (last & (Page - 1)) != 0) return false;
+    const std::uintptr_t at = address & ~static_cast<std::uintptr_t>(Page - 1);
+    const PhysicalPage* here = pageOf(at);
+    if (here == nullptr) return false;
+    viewBegin = at;
+    while (viewBegin > first) {
+        const PhysicalPage* before = pageOf(viewBegin - Page);
+        if (before == nullptr || before->backing != here->backing || before->offset + (at - viewBegin) + Page != here->offset) break;
+        viewBegin -= Page;
+    }
+    viewEnd = at + Page;
+    while (viewEnd < last) {
+        const PhysicalPage* after = pageOf(viewEnd);
+        if (after == nullptr || after->backing != here->backing || after->offset != here->offset + (viewEnd - at)) break;
+        viewEnd += Page;
+    }
+    backing = here->backing.get();
+    backingOffset = here->offset - (at - viewBegin);
+    return true;
+}
+
+std::mutex g_aliasLock;
+std::map<void*, std::size_t> g_aliases; // alias -> length, for RytyDirectMemoryUnmapAlias
+} // namespace
+
+// The direct-memory view around address (see DirectView); false when the address is not direct
+// memory. The renderer's GuestViewBase/GuestViewEnd on Linux.
+extern "C" bool RytyDirectMemoryView_nid_no_patch(std::uint64_t address, std::uint64_t* begin, std::uint64_t* end) {
+    std::lock_guard lock(g_directLock);
+    std::uintptr_t viewBegin = 0, viewEnd = 0;
+    const PhysicalBacking* backing = nullptr;
+    std::uint64_t offset = 0;
+    if (!DirectView(address, viewBegin, viewEnd, backing, offset)) return false;
+    *begin = viewBegin;
+    *end = viewEnd;
+    return true;
+}
+
+// A read-write alias of the view [address, address + bytes) (as GuestArenaMapAlias on Windows),
+// or null when it is not one backing's contiguous direct memory.
+extern "C" void* RytyDirectMemoryMapAlias_nid_no_patch(std::uint64_t address, std::uint64_t bytes) {
+    std::uintptr_t viewBegin = 0, viewEnd = 0;
+    const PhysicalBacking* backing = nullptr;
+    std::uint64_t offset = 0;
+    void* alias = nullptr;
+    {
+        std::lock_guard lock(g_directLock);
+        if (!DirectView(address, viewBegin, viewEnd, backing, offset) || address + bytes > viewEnd) return nullptr;
+        alias = backing->MapAlias(offset + (address - viewBegin), bytes);
+    }
+    if (alias != nullptr) {
+        std::lock_guard lock(g_aliasLock);
+        g_aliases[alias] = bytes;
+    }
+    return alias;
+}
+
+extern "C" void RytyDirectMemoryUnmapAlias_nid_no_patch(void* alias) {
+    std::size_t bytes = 0;
+    {
+        std::lock_guard lock(g_aliasLock);
+        const auto it = g_aliases.find(alias);
+        if (it == g_aliases.end()) return;
+        bytes = it->second;
+        g_aliases.erase(it);
+    }
+    ::munmap(alias, bytes);
 }
 #endif
 
