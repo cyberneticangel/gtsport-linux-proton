@@ -143,8 +143,13 @@ namespace {
 constexpr int GuestMapFixedFlag = 0x10;
 
 #if defined(__linux__)
+// The guest arena, where Windows places every non-fixed guest mapping (and where the renderer
+// tracks guest memory: shadGT's FIX-055 treats anything else as the emulator's own).
+constexpr std::uintptr_t LinuxGuestArenaBase = 0x200000000ull;
+constexpr std::uintptr_t LinuxGuestArenaEnd = 0xFC00000000ull;
+
 void* MapAtOrAbove(std::uintptr_t start, size_t len, int prot, size_t alignment) {
-    constexpr std::uintptr_t UserLimit = 0x7fff00000000ull;
+    constexpr std::uintptr_t UserLimit = LinuxGuestArenaEnd;
     for (int attempt = 0; attempt < 8; ++attempt) {
         std::vector<std::pair<std::uintptr_t, std::uintptr_t>> used;
         std::ifstream maps("/proc/self/maps");
@@ -162,7 +167,12 @@ void* MapAtOrAbove(std::uintptr_t start, size_t len, int prot, size_t alignment)
             if (begin >= candidate + len) break;
             candidate = (end + alignment - 1) & ~(static_cast<std::uintptr_t>(alignment) - 1);
         }
-        if (candidate + len > UserLimit || candidate + len < candidate) throw std::runtime_error("No free range above the mapping address hint");
+        if (candidate + len > UserLimit || candidate + len < candidate) {
+            char message[160];
+            std::snprintf(message, sizeof(message), "No free range above the mapping address hint %#lx (length %#zx, alignment %#zx)",
+                          static_cast<unsigned long>(start), len, alignment);
+            throw std::runtime_error(message);
+        }
         void* result = mmap(reinterpret_cast<void*>(candidate), len, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
         if (result != MAP_FAILED) return result;
         if (errno != EEXIST) throw std::system_error(errno, std::generic_category(), "Hinted mmap failed");
@@ -418,7 +428,11 @@ void* MapPlaced(void* addr, size_t len, int prot, int flags, size_t alignment) {
     }
     if (addr) {
 #if defined(__linux__)
-        return MapAtOrAbove(reinterpret_cast<std::uintptr_t>(addr), len, prot, alignment);
+        // A non-fixed address is only a hint, as on Windows: honored inside the guest arena,
+        // otherwise (GT Sport passes 0xfffffffff0000000) the mapping goes into the arena anyway.
+        const auto hint = reinterpret_cast<std::uintptr_t>(addr);
+        const bool in_arena = hint >= LinuxGuestArenaBase && hint < LinuxGuestArenaEnd;
+        return MapAtOrAbove(in_arena ? hint : LinuxGuestArenaBase, len, prot, alignment);
 #elif defined(_WIN32)
         // A non-fixed address is only a hint; PS4 titles accept any placement in the arena.
         return mmap_aligned(len, prot, alignment);
@@ -428,6 +442,8 @@ void* MapPlaced(void* addr, size_t len, int prot, int flags, size_t alignment) {
     }
 #ifdef _WIN32
     return mmap_aligned(len, prot, alignment);
+#elif defined(__linux__)
+    return MapAtOrAbove(LinuxGuestArenaBase, len, prot, alignment); // in the arena, as on Windows
 #endif
     if (len > std::numeric_limits<size_t>::max() - alignment) {
         throw std::overflow_error("Aligned mapping size overflow");

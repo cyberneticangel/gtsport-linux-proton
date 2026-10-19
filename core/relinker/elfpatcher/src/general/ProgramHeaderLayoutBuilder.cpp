@@ -117,10 +117,11 @@ std::uint64_t ProgramHeaderLayoutBuilder::ComputeExtraBlockVaddr(
 
     const std::uint64_t align = kDefaultLoadAlignment;
     const std::uint64_t offsetRemainder = extraBlockOffset & (align - 1);
-    const std::uint64_t alignedFloor = highestVaddrEnd & ~(align - 1);
-    std::uint64_t vaddr = alignedFloor | offsetRemainder;
-    if (vaddr < highestVaddrEnd)
-        vaddr += align;
+    // The block starts on a page of its own. In the page where the last segment ends, its
+    // mapping would replace that segment's tail, so the zero-filled end of a segment's .bss
+    // (GT Sport keeps pointers there that must start null) would hold file bytes instead.
+    const std::uint64_t alignedCeil = (highestVaddrEnd + align - 1) & ~(align - 1);
+    const std::uint64_t vaddr = alignedCeil | offsetRemainder;
     if (vaddr < highestVaddrEnd)
         throw Domain::RelinkerException("Extra block vaddr computation overflowed");
     return vaddr;
