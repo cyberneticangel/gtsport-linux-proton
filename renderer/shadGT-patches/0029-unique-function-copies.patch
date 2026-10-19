@@ -1,0 +1,60 @@
+From 01ad176b7c070e064a59b78dd6340f09bec16379 Mon Sep 17 00:00:00 2001
+From: cyberneticangel <dylan.fantauzzo7@proton.me>
+Date: Mon, 19 Oct 2026 18:25:53 +0200
+Subject: [PATCH] ryGT: UniqueFunction stores a copy of a named functor, never
+ a reference
+
+Passing a named lambda (an lvalue) made Functor a reference type, so the
+callable kept a reference to the caller's local. Liverpool::ProcessGraphics
+records its occlusion-results writer that way (Record(write_results, ...)):
+the recorder ran it after the decoder had left that scope, reading a freed
+part of the coroutine frame, and GT Sport races crashed in
+shadGT:GpuRecorder (access violation in ProcessGraphics::<lambda_42>).
+It was the only callable stored by reference in the renderer.
+---
+ src/common/unique_function.h | 14 +++++++++++---
+ 1 file changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/src/common/unique_function.h b/src/common/unique_function.h
+index ab8b48be..9e670f3d 100755
+--- a/src/common/unique_function.h
++++ b/src/common/unique_function.h
+@@ -4,6 +4,7 @@
+ #pragma once
+ 
+ #include <memory>
++#include <type_traits>
+ #include <utility>
+ 
+ #include "common/recycling_pool.h"
+@@ -38,7 +39,8 @@ class UniqueFunction {
+     template <typename Functor>
+     class Callable final : public CallableBase {
+     public:
+-        Callable(Functor&& functor_) : functor{std::move(functor_)} {}
++        template <typename F>
++        explicit Callable(F&& functor_) : functor{std::forward<F>(functor_)} {}
+         ~Callable() override = default;
+ 
+         ResultType operator()(Args&&... args) override {
+@@ -52,9 +54,15 @@ class UniqueFunction {
+ public:
+     UniqueFunction() = default;
+ 
+-    template <typename Functor>
++    // Stores a copy (or the moved functor), never a reference: a named lambda passed as an
++    // lvalue made Functor a reference type, and the callable kept a reference to a local that
++    // was gone when the function ran (GT Sport races: the recorder crashed running
++    // "occlusion results" through a dangling reference into ProcessGraphics' coroutine frame).
++    template <typename Functor,
++              typename = std::enable_if_t<!std::is_same_v<std::decay_t<Functor>, UniqueFunction>>>
+     UniqueFunction(Functor&& functor)
+-        : callable{std::make_unique<Callable<Functor>>(std::move(functor))} {}
++        : callable{std::make_unique<Callable<std::decay_t<Functor>>>(
++              std::forward<Functor>(functor))} {}
+ 
+     UniqueFunction& operator=(UniqueFunction&& rhs) noexcept = default;
+     UniqueFunction(UniqueFunction&& rhs) noexcept = default;
+-- 
+2.56.0
+
