@@ -145,6 +145,15 @@ static void ApplyJobAffinity(PthreadPrivate& thread, void* handle) {
     CpuTopology::PinTraced(thread.name.c_str(), handle, mask);
 }
 
+// Wine and Proton: ntdll exports wine_get_version there only.
+static bool RunningOnWine() {
+    static const bool wine = [] {
+        const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        return ntdll != nullptr && GetProcAddress(ntdll, "wine_get_version") != nullptr;
+    }();
+    return wine;
+}
+
 struct NativeThreadArgs {
     std::unique_ptr<ThreadArgs> guest;
     std::future<bool> start;
@@ -161,6 +170,11 @@ static unsigned __stdcall StartNativeThread(void* opaque) {
         if (high <= low || high - low < self->stackSize)
             throw std::runtime_error("Cannot query guest thread stack");
         self->stackAddress = reinterpret_cast<void*>(high - self->stackSize);
+        // Wine always puts guard pages at the bottom of a stack, inside a guest range of 2 MB or more:
+        // the stack is reserved with headroom below the guest range (scePthreadCreate), and guest code,
+        // which does not probe its stack, gets the whole range committed here.
+        if (RunningOnWine() && !VirtualAlloc(self->stackAddress, self->stackSize, MEM_COMMIT, PAGE_READWRITE))
+            throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "Committing guest thread stack");
         for (auto cursor = high - self->stackSize; cursor < high;) {
             MEMORY_BASIC_INFORMATION memory{};
             if (VirtualQuery(reinterpret_cast<void*>(cursor), &memory, sizeof(memory)) != sizeof(memory) || memory.State != MEM_COMMIT || memory.Protect != PAGE_READWRITE || memory.RegionSize == 0)
@@ -210,12 +224,15 @@ int APS5_VABI scePthreadCreate(Pthread* thread, const PthreadAttr* attr, Pthread
 #ifdef _WIN32
     SYSTEM_INFO system{};
     GetSystemInfo(&system);
-    const std::size_t nativeStack = (p->stackSize + system.dwPageSize - 1) / system.dwPageSize * system.dwPageSize;
+    // Under Wine: reserved, with 64 KB for the guard pages below the guest range (see StartNativeThread).
+    const bool wine = RunningOnWine();
+    const std::size_t headroom = wine ? 0x10000 : 0;
+    const std::size_t nativeStack = (p->stackSize + headroom + system.dwPageSize - 1) / system.dwPageSize * system.dwPageSize;
     if (p->stackSize < 16384 || nativeStack > std::numeric_limits<unsigned>::max())
         throw std::runtime_error("scePthreadCreate: invalid Windows stack size");
     auto native = std::make_unique<NativeThreadArgs>(NativeThreadArgs{std::move(args), start.get_future(), {}});
     auto initialized = native->initialized.get_future();
-    const auto handle = _beginthreadex(nullptr, static_cast<unsigned>(nativeStack), StartNativeThread, native.get(), 0, nullptr);
+    const auto handle = _beginthreadex(nullptr, static_cast<unsigned>(nativeStack), StartNativeThread, native.get(), wine ? STACK_SIZE_PARAM_IS_A_RESERVATION : 0, nullptr);
     if (handle == 0)
         throw std::system_error(errno, std::generic_category(), "Creating guest thread");
     p->nativeHandle = reinterpret_cast<void*>(handle);

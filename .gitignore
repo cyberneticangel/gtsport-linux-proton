@@ -50,3 +50,11 @@ __pycache__/
 *~
 .DS_Store
 Thumbs.db
+
+# Game and firmware files (never committed)
+*.pkg
+*.sprx
+/basegame/
+/update/
+/ps4_firmware_modules/
+/fonts/

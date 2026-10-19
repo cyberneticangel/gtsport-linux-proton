@@ -1,145 +1,137 @@
-# RyGT
+# gtsport-linux-proton
 
-<h1 align="center">
-  <img src="assets/GranTurismoSportBanner.png" width="800" alt="Gran Turismo Sport banner">
-  <br>
-  <b>RyGT</b>
-  <br>
-  <sub>Gran Turismo Sport on PC</sub>
-</h1>
+Gran Turismo Sport (PS4) on Linux, through [RyGT](https://github.com/mlgprorektm8/RyGT) and Proton.
 
+RyGT turns GT Sport's executable into a Windows program (`GTSport.exe`) that runs the game code
+directly on your CPU, with a Vulkan renderer ([shadGT](https://github.com/mlgprorektm8/shadGT/tree/ryty-gpu))
+standing in for the PS4's GPU. This fork adds what it takes to set that up and run it on Linux:
 
-**Gran Turismo Sport running as a native Windows program.**
+- `tools/linux/rygt-proton.sh`: set up, play and check RyGT in a Proton prefix of its own;
+- `tools/linux/extract-pkg.sh`: extracts your PKGs into folders Set up accepts, with fixes for
+  two LibOrbisPkg bugs that otherwise corrupt the game files or stop the 1.69 update;
+- `tools/linux/patch-libkernel-tz.py`: lets current RyGT builds start under Proton;
+- `tools/wineprobe`: checks your Proton and GPU for what RyGT needs, without the game;
+- runtime and loader changes for Wine (guest thread stacks, Wine detection), and support for the
+  European release **CUSA02168** next to the US one (CUSA03220).
 
-RyGT ports Gran Turismo Sport (CUSA03220, update 1.69) from PlayStation 4 to Windows. The game is
-not emulated: RyGT's converter turns the game's executable into `GTSport.exe`, the game code runs
-directly on your CPU, and RyGT's libraries stand in for the PS4 system. Graphics go through
-[shadGT](https://github.com/mlgprorektm8/shadGT/tree/ryty-gpu)'s Vulkan renderer, built as the
-game's video output library.
+The original README is in [README.upstream.md](README.upstream.md). The details of everything below
+are in [docs/gt-sport/LINUX.md](docs/gt-sport/LINUX.md).
 
-RyGT is a fork of [Ryty](https://github.com/aarvsn/Ryty), the general PS4/PS5 porting tool, with
-everything GT Sport needs added on top.
+No game files, PS4 firmware files or fonts are included. You need your own GT Sport (base game
+and update 1.69) and your own PS4 firmware's modules and fonts.
 
-## Status
+## What you need
 
-| Area | State |
+| | |
 | --- | --- |
-| Boot, menus, car and track selection | Working |
-| Races | Working, about 42-60 fps depending on how many cars are on screen |
-| Race summary and results | Working |
-| Audio | Working |
-| Controllers | Working through SDL |
-| Online features | Not supported |
+| Game | GT Sport CUSA03220 (US) or CUSA02168 (EU): the base game PKG and the 1.69 update PKG, or folders already extracted |
+| Firmware | Decrypted system modules (`libSceFont`, `libSceFontFt`, `libSceFreeTypeOt`, `libSceJson2`, `libSceNgs2`, and `libSceJpegDec`/`libScePngEnc` if you have them; `.sprx` or `.prx`) and the `font` and `font2` folders from `/system/common` |
+| RyGT | A RyGT release zip (Windows build) from [Releases](https://github.com/mlgprorektm8/RyGT/releases) |
+| Proton | Steam with **Proton Experimental** (Proton-CachyOS or GE builds on Wine 11 also work) |
+| GPU | Vulkan with `VK_EXT_external_memory_host` (current Mesa RADV or NVIDIA) |
+| System | `vm.max_map_count` of at least 1048576 (the default on Arch, CachyOS, Fedora, SteamOS, Ubuntu 24.04+) |
+| Tools | `gcc`, Python 3, the .NET 8 SDK (PKG extraction); Mono (only to build the loader); `mingw-w64-gcc` (only for the probe) |
 
-Known issues:
-- The first 30 seconds of a race can stutter while graphics pipelines compile.
-- A few draws in the race summary can occasionally read garbage vertex descriptors; those draws
-  are skipped.
+About 100 GB of free space for the extracted game, plus the PKGs while you extract them.
 
-Tested on Windows 11 with an Intel i7-13700KF and an RTX 4070Ti.
-Tested on Windows 11 with an AMD Ryzen 5 9600X and an RTX 3060 12GB
+## Build
 
-## Download
+The game's runtime and renderer are Windows programs, built on Windows as described in
+[docs/user/BUILDING.md](docs/user/BUILDING.md) and [renderer/README.md](renderer/README.md); use a
+release zip for them. The Linux-side pieces build here:
 
-Get the latest build from [Releases](https://github.com/mlgprorektm8/RyGT/releases). A release
-contains the runtime libraries, the renderer, the converter, a launcher and the GT Sport settings.
-It contains **no game files**: you need your own decrypted dump of GT Sport CUSA03220 with update
-1.69, and the system modules and fonts from your own PS4 firmware.
+**PKG extraction tool** (LibOrbisPkg's PkgTool, with this fork's fixes):
 
-Unzip it on the same drive as your dump and run `RyGT.exe`: pick your game, update, firmware
-module and font folders, press **Set up**, then **Play**. The loader's source is in
-[loader](loader). Manual setup steps are in [docs/gt-sport/README.md](docs/gt-sport/README.md).
-
-## How it fits together
-
-```
-your dump: eboot.bin (1.69) + sce_module
-        |
-        |  unwrap the SELF, then convert with ryty.exe --windows --ps4
-        v
-GTSport.exe + app0\sce_module\*.guest.prx
-        |
-        |  loads at run time
-        v
-libs\  RyGT runtime libraries (kernel, libc, save data, audio, input, ...)
-       + shadGT renderer (libSceVideoOut.prx: Gnm driver, PM4 processing, Vulkan)
+```sh
+git clone https://github.com/maxton/LibOrbisPkg && cd LibOrbisPkg
+git checkout 6434772
+git apply ~/gtsport-linux-proton/tools/linux/liborbispkg-linux.patch
+dotnet publish PkgTool.Core/PkgTool.Core.csproj -c Release -o ~/.local/share/rygt/pkgtool
 ```
 
-## What this repository contains
+**Loader** (`RyGT.exe`, the launcher and Set up), when you want this fork's version, for example for
+the European release. Needs Mono:
 
-- **Converter** ([core/relinker](core/relinker)): turns the PS4 executable and its modules into
-  Windows binaries. RyGT adds fixes for GT Sport's executable and modules.
-- **Runtime libraries** ([core/libs/prx](core/libs/prx)): the PS4 system libraries the game links
-  against. RyGT's changes for GT Sport include:
-  - kernel: an event queue bridge for the renderer, mapping and protection change notices so the
-    renderer's memory tracking stays correct, `MAP_FIXED` replacing mappings, direct memory and
-    semaphore fixes;
-  - libc: C++ exceptions through the SEH runtime, guest allocation fixes, crash reports with
-    debugging aids;
-  - save data, AppContent, audio output and network control fixes, including holding the first
-    save data mount until the boot screen is drawn (GT Sport's boot script otherwise crashes).
-- **Loader** ([loader](loader)): `RyGT.exe`, which converts the game from your own dump and
-  starts it, with options for the splash screen, FPS counter, Discord and AMD FSR 3.1 or FSR 1 upscaling.
-- **DLSS plugin** ([plugins/dlss](plugins/dlss)): optional NVIDIA DLSS upscaling, built and
-  installed separately (not in the releases).
-- **GT Sport guide** ([docs/gt-sport](docs/gt-sport)): setup from your own dump.
+```sh
+loader/build.sh ~/Games/RyGT        # replaces the release's RyGT.exe; keep a copy if you like
+```
 
-The renderer lives in [shadGT, branch `ryty-gpu`](https://github.com/mlgprorektm8/shadGT/tree/ryty-gpu)
-(`ryty_gpu/`). It builds shadGT's video output, Gnm driver and Vulkan renderer as
-`libSceVideoOut.prx`, plus shadGT's audio, NP and other libraries for RyGT. It carries the GT
-Sport rendering fixes and the performance work (Vulkan calls on their own thread, cheaper buffer
-and image tracking).
+**Offline livery scripts tool** (optional; the release's `adcpatch.exe` normally works under
+Proton Experimental): see [tools/adcpatch/README.txt](tools/adcpatch/README.txt), publish it with
+`-r linux-x64` and save it as `tools/adcpatch/adcpatch` in the RyGT folder.
 
-## Building
+**wineprobe** builds by itself the first time you run `rygt-proton.sh probe`.
 
-- **Runtime libraries:** the Windows MinGW build in an MSYS2 shell (link-time optimization off).
-  See [docs/user/BUILDING.md](docs/user/BUILDING.md).
-- **Converter:** the `ryty` target in [core/relinker](core/relinker).
-- **Renderer:** in shadGT's `ryty-gpu` branch,
-  `cmake --preset x64-Clang-Release -DSHADGT_RYTY_GPU=ON`, then build the `ryty_gpu` target.
+## Use
 
-## Branches
+**1. Extract the game.** Once per PKG; each takes a few minutes and writes `<folder>/uroot`:
 
-- `main`: stable builds; releases come from here.
-- `development`: ongoing work. Changes reach `main` once they are tested.
+```sh
+tools/linux/extract-pkg.sh base.pkg   ~/PS4/CUSA02168
+tools/linux/extract-pkg.sh update.pkg ~/PS4/CUSA02168-patch
+```
 
-# Discord Server
-Join our server for more updates: https://discord.gg/8dz4U9Nd8d
+It checks that the PKG is complete first (a truncated copy is the most common problem), and also
+writes `sce_sys` (`param.sfo` and the rest), which the game needs and PkgTool leaves out.
 
-## Documentation
+**2. Unpack RyGT** and make it start under Proton:
 
-- [GT Sport setup](docs/gt-sport/README.md)
-- Ryty's general documentation: [index](docs/README.md), [building](docs/user/BUILDING.md),
-  [usage](docs/user/USAGE.md), [input mapping](docs/user/INPUT_MAPPING.md),
-  [porting pipeline](docs/dev/PORTING_PIPELINE.md)
+```sh
+mkdir -p ~/Games && cd ~/Games && unzip GTSport-Ryty-shadGT-*.zip && mv GTSport-Ryty-shadGT-*/ RyGT
+python3 ~/gtsport-linux-proton/tools/linux/patch-libkernel-tz.py ~/Games/RyGT
+```
 
-## Credits
+The patch script does nothing on builds that don't need it.
 
-- [Ryty](https://github.com/aarvsn/Ryty) by aarvsn, itself a fork of
-  [AnyPS5](https://github.com/boykopovar/AnyPS5) by Andrii Semkiv (boykopovar) and its
-  contributors: the converter, the system library implementations and the test infrastructure.
-- [shadPS4](https://github.com/shadps4-emu/shadPS4) and its contributors, through shadGT: the
-  renderer, shader recompiler and HLE libraries.
-- [Nenkai](https://github.com/Nenkai): [GTToolsSharp](https://github.com/Nenkai/GTToolsSharp)
-  (reading the game's volumes) and [GTAdhocToolchain](https://github.com/Nenkai/GTAdhocToolchain)
-  (the AdHoc script compiler and disassembler), both MIT licensed. The launcher uses them to build
-  the offline livery and decal scripts from your own game files, and Nenkai's research into
-  Gran Turismo's formats and scripts made that work possible.
-- See [AUTHORS.md](AUTHORS.md).
+**3. Set up** (converts the game, links the game files, copies the fonts, makes the offline
+livery scripts):
 
-## Disclaimer
+```sh
+tools/linux/rygt-proton.sh setup ~/Games/RyGT \
+    --game ~/PS4/CUSA02168/uroot --update ~/PS4/CUSA02168-patch/uroot \
+    --modules ~/PS4/firmware/sys_modules --fonts ~/PS4/firmware/fonts
+```
 
-This project is for interoperability, research and preservation. It does not include or
-distribute copyrighted games, firmware, keys or proprietary libraries. Use your own legally
-obtained copy of the game and your own console's firmware files, in line with the laws where
-you live.
+`--fonts` is the folder holding `font` and `font2`. Set up's log is in `~/Games/RyGT/setup.log`.
 
-Please do NOT ask shadps4 or Ryty servers for help from this project.
+**4. Play:**
+
+```sh
+tools/linux/rygt-proton.sh play ~/Games/RyGT
+tools/linux/rygt-proton.sh launcher ~/Games/RyGT   # the launcher window: options, controls, Play
+tools/linux/rygt-proton.sh steam ~/Games/RyGT      # what to enter to add it to Steam instead
+```
+
+The game writes `stdout.log` and `stderr.log` in the RyGT folder. Every 10 seconds `stdout.log`
+gets a line like `DIAG-046 frames in 10.0 s: ... (60.0 fps)`, and slow frames get a `hitch` line
+saying where the time went.
+
+## Performance
+
+- **The first hours stutter.** The renderer builds each new GPU pipeline the first time the game
+  needs it, and the release has no prepared shader list. Everything it builds is kept in
+  `user/cache`, and with "Precompile shaders" on (the default), it is built again on the splash
+  screen at the next start instead of during play. In the launcher, set **When new shaders
+  compile** to **Keep going** so the game doesn't slow down while a shader builds (in races it
+  never does).
+- **Busy scenes are slower than on Windows, especially on AMD.** Under Proton the direct renderer
+  can't import game memory on AMD GPUs, so it copies buffers and write-protects their pages, and
+  every protection is slow under Wine. LINUX.md explains why, and what the experimental
+  `RYGT_USERPTR=1` does about it (it is off because, for now, it makes long races slower).
+- **Settings that help:** untick **Wet-road reflections** for much more speed in rain, tick
+  **Rear-view mirror at half rate**, and use `powerprofilesctl set performance` while playing.
+
+## Troubleshooting
+
+| What you see | Why, and what to do |
+| --- | --- |
+| The game closes right after the window opens; `play` output has `unimplemented function KERNEL32.dll.SystemTimeToTzSpecificLocalTimeEx` | Run `patch-libkernel-tz.py` on the RyGT folder (step 2) |
+| `stderr.log` ends with `neither param.json nor param.sfo found` | The game folders have no `sce_sys/param.sfo`: extract with `extract-pkg.sh`, which writes it |
+| `extract-pkg.sh`: `... is truncated` | Copy the PKG again; compare its size with the original |
+| Set up: "the offline livery scripts could not be made", or adcpatch crashes reading `gt.idx` | The game files were extracted with an unpatched PkgTool and have holes; extract again with the patched one |
+| Everything is slow and the disk is busy | Another extraction or Set up is still running; both are I/O heavy |
+| Anything else | Run `tools/linux/rygt-proton.sh probe` and see [LINUX.md](docs/gt-sport/LINUX.md) |
 
 ## License
 
-GNU General Public License version 2 only, as Ryty. The renderer (shadGT) is also GPL-2.0.
-
-<p align="center">
-  <img src="assets/GranTurismoSportBanner2.webp" width="800" alt="Gran Turismo Sport banner">
-</p>
+GPL-2.0, as RyGT and Ryty; see [LICENSE](LICENSE). Third-party parts keep their own licenses.
