@@ -1,4 +1,7 @@
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -521,9 +524,12 @@ void NotifyRenderer(const char* name, const void* addr, size_t len) {
         function(reinterpret_cast<std::uint64_t>(addr), len);
     }
 #else
-    (void)name;
-    (void)addr;
-    (void)len;
+    // Linux: the renderer's exports are in the process's global scope.
+    using RangeFunction = void (*)(std::uint64_t, std::uint64_t);
+    if (addr == nullptr || len == 0) return;
+    if (const auto function = reinterpret_cast<RangeFunction>(dlsym(RTLD_DEFAULT, name))) {
+        function(reinterpret_cast<std::uint64_t>(addr), len);
+    }
 #endif
 }
 

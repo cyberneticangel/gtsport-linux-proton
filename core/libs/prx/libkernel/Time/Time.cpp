@@ -1,4 +1,7 @@
 #include "prx/libkernel/Time/include/Time.hpp"
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
 #include "prx/libkernel/Time/include/TimedWait.hpp"
 
 #include "prx/libc/include/General.hpp"
@@ -114,7 +117,6 @@ static std::uint64_t GetMonotonicNanos() {
     return origin + static_cast<std::uint64_t>(static_cast<double>(raw - origin) * TimeScale());
 }
 
-#ifdef _WIN32
 // The shadGT renderer (libSceVideoOut.prx) holds the guest clocks while its GPU thread compiles
 // shaders or pipelines, which a PS4 never does (its shaders are precompiled). Its RytyGpuGuestTsc
 // export is the host TSC with those pauses taken out. Without it a compile stall looks like a frame
@@ -130,10 +132,14 @@ static GuestTscFn RendererGuestTsc() {
     // Looked up again now and then until the renderer is loaded (it loads before the game starts).
     if ((misses.fetch_add(1, std::memory_order_relaxed) & 4095) != 0) return nullptr;
     if (std::getenv("APS5_NO_GUEST_CLOCK") != nullptr) return nullptr;
+#ifdef _WIN32
     if (HMODULE renderer = GetModuleHandleA("libSceVideoOut.prx")) {
         fn = reinterpret_cast<GuestTscFn>(reinterpret_cast<void*>(GetProcAddress(renderer, "RytyGpuGuestTsc")));
-        if (fn != nullptr) found.store(fn, std::memory_order_release);
     }
+#else
+    fn = reinterpret_cast<GuestTscFn>(dlsym(RTLD_DEFAULT, "RytyGpuGuestTsc"));
+#endif
+    if (fn != nullptr) found.store(fn, std::memory_order_release);
     return fn;
 }
 
@@ -159,11 +165,6 @@ static std::uint64_t GuestMonotonicNanos() {
     }
     return std::max(nanos, previous);
 }
-#else
-static std::uint64_t GuestMonotonicNanos() {
-    return GetMonotonicNanos();
-}
-#endif
 
 static std::uint64_t GetStartNanos() {
     static const std::uint64_t start = GuestMonotonicNanos();

@@ -5,8 +5,11 @@ extern "C" void LibcCaptureRegisters(std::uintptr_t*);
 extern "C" [[noreturn]] void LibcRestoreRegisters(const std::uintptr_t*);
 
 #if defined(__linux__) && defined(__x86_64__)
+// Global (and hidden): with link-time optimization the callers can land in another partition,
+// where a local label is not visible.
 asm(
 ".text\n"
+".globl LibcCaptureRegisters\n"
 ".hidden LibcCaptureRegisters\n"
 ".type LibcCaptureRegisters,@function\n"
 "LibcCaptureRegisters:\n"
@@ -17,7 +20,7 @@ asm(
 "movq %r12,96(%rdi)\nmovq %r13,104(%rdi)\nmovq %r14,112(%rdi)\nmovq %r15,120(%rdi)\n"
 "movq (%rsp),%rax\nmovq %rax,128(%rdi)\nret\n"
 ".size LibcCaptureRegisters,.-LibcCaptureRegisters\n"
-".hidden LibcRestoreRegisters\n.type LibcRestoreRegisters,@function\n"
+".globl LibcRestoreRegisters\n.hidden LibcRestoreRegisters\n.type LibcRestoreRegisters,@function\n"
 "LibcRestoreRegisters:\n"
 "movq %rdi,%r10\nmovq 128(%r10),%r11\n"
 "movq 0(%r10),%rax\nmovq 8(%r10),%rdx\nmovq 16(%r10),%rcx\nmovq 24(%r10),%rbx\n"

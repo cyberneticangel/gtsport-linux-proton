@@ -1,4 +1,9 @@
 #include <atomic>
+#include <chrono>
+#include <thread>
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
 #include <cstdlib>
 #ifdef _WIN32
 #include <windows.h>
@@ -130,6 +135,18 @@ static void WaitForBootScreen() {
                            result == WAIT_OBJECT_0 ? "drawn" : "timed out");
             CloseHandle(event);
         }
+#else
+        // Linux: the renderer is in the same process; poll its flag (RytyGpuFirstDrawDone).
+        using DoneFn = bool (*)();
+        const auto done = reinterpret_cast<DoneFn>(dlsym(RTLD_DEFAULT, "RytyGpuFirstDrawDone"));
+        if (done == nullptr) return;
+        const auto start = std::chrono::steady_clock::now();
+        bool drawn = false;
+        while (!(drawn = done()) && std::chrono::steady_clock::now() - start < std::chrono::seconds(20))
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        SAVEDATA_TRACE("waited %lld ms for the boot screen before the first save access: %s",
+                       static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count()),
+                       drawn ? "drawn" : "timed out");
 #endif
     });
 }

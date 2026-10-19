@@ -1,4 +1,7 @@
 #include "prx/libkernel/File/include/FileFlags.hpp"
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
 #include "prx/libkernel/File/include/NativeStat.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libkernel/File/include/File.hpp"
@@ -107,8 +110,9 @@ void PrepareGuestWrite(void* buffer, std::size_t bytes) {
     }
     if (invalidate != nullptr && buffer != nullptr && bytes != 0) invalidate(reinterpret_cast<std::uint64_t>(buffer), bytes);
 #else
-    (void)buffer;
-    (void)bytes;
+    using RangeFunction = void (*)(std::uint64_t, std::uint64_t);
+    static const auto invalidate = reinterpret_cast<RangeFunction>(dlsym(RTLD_DEFAULT, "RytyGpuInvalidateMemory"));
+    if (invalidate != nullptr && buffer != nullptr && bytes != 0) invalidate(reinterpret_cast<std::uint64_t>(buffer), bytes);
 #endif
 }
 

@@ -1,4 +1,7 @@
 #include <cstddef>
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
@@ -98,6 +101,11 @@ int APS5_VABI sceSystemServiceHideSplashScreen(void) {
                 reinterpret_cast<void*>(GetProcAddress(renderer, "RytyGpuHideSplashScreen")))) {
             hide();
         }
+    }
+#else
+    using HideFunction = void (*)();
+    if (const auto hide = reinterpret_cast<HideFunction>(dlsym(RTLD_DEFAULT, "RytyGpuHideSplashScreen"))) {
+        hide();
     }
 #endif
  return SYSTEM_SERVICE_OK;
