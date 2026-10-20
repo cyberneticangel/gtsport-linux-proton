@@ -172,10 +172,12 @@ int APS5_VABI scePthreadMutexLock(PthreadMutex* mutex) {
         // Adaptive spin, as the console's mutexes (and Windows' locks) do: a contended lock
         // is usually released within a few microseconds, and glibc's mutexes would otherwise
         // wait and wake through the kernel each time (GT Sport's job threads spent ~20% of a
-        // heavy race in futex wait/wake). RYTY_MUTEX_SPIN=<tries> (0 off, default 200).
+        // heavy race in futex wait/wake). RYTY_MUTEX_SPIN=<tries>, off by default: with 200
+        // tries the spinning itself took 34% of the CPU in a race (pthread_mutex_trylock and
+        // this function at the top of the profile), more than the futex calls it saved.
         static const int spins = [] {
             const char* env = std::getenv("RYTY_MUTEX_SPIN");
-            return env && *env ? std::atoi(env) : 200;
+            return env && *env ? std::atoi(env) : 0;
         }();
         for (int i = 0; i < spins; ++i) {
             if (native.try_lock()) return true;
