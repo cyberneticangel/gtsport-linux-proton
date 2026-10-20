@@ -7,6 +7,9 @@
 #include <limits>
 #include <utility>
 #include <cerrno>
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
 
 #include "prx/libc/include/FileStream.hpp"
 #include "prx/libc/include/ApplicationHeap.hpp"
@@ -78,10 +81,28 @@ int APS5_VABI fclose_nid_postfix(FileStream* stream) {
     return 0;
 }
 
+#ifndef _WIN32
+// The renderer (libSceVideoOut.prx) write-protects guest memory it caches; the kernel's write into
+// such a page (glibc reads large blocks straight into the destination) fails instead of faulting.
+// As libkernel's file reads do, the renderer is told first: it lifts the protection and drops its
+// copy. Looked up in the renderer itself: every shadGT library exports the Ryty entry points.
+static void PrepareGuestWrite(void* buffer, std::size_t bytes) {
+    using RangeFunction = void (*)(std::uint64_t, std::uint64_t);
+    static const auto invalidate = [] {
+        void* renderer = dlopen("libSceVideoOut.prx", RTLD_NOW | RTLD_NOLOAD);
+        return renderer ? reinterpret_cast<RangeFunction>(dlsym(renderer, "RytyGpuInvalidateMemory")) : nullptr;
+    }();
+    if (invalidate != nullptr && buffer != nullptr && bytes != 0) invalidate(reinterpret_cast<std::uint64_t>(buffer), bytes);
+}
+#endif
+
 size_t APS5_VABI fread_nid_postfix(void* buffer, size_t size, size_t count, FileStream* stream) {
     auto* handle = GetNativeStream(stream);
     if (size == 0 || count == 0) return 0;
     if (!buffer) throw std::runtime_error("fread: null buffer");
+#ifndef _WIN32
+    if (count <= std::numeric_limits<size_t>::max() / size) PrepareGuestWrite(buffer, size * count);
+#endif
     const auto result = std::fread(buffer, size, count, handle);
     stream->SyncStatus();
     if (std::ferror(handle)) throw std::runtime_error("fread: read failed");

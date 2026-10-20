@@ -13,6 +13,9 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <cerrno>
+#include <sys/mman.h>
 #endif
 
 namespace GuestArena {
@@ -60,24 +63,46 @@ public:
         std::lock_guard lock(_lock);
         std::uintptr_t candidate = alignUp(_base, alignment);
         for (const auto& [start, end] : _used) {
-            if (candidate < start && bytes <= start - candidate) {
 #ifdef _WIN32
+            if (candidate < start && bytes <= start - candidate) {
                 if (void* reserved = WindowsMappings::Get().FindAndReserve(candidate, start, bytes, alignment)) {
                     const auto address = reinterpret_cast<std::uintptr_t>(reserved);
                     _used.emplace(address, address + bytes);
                     return reserved;
                 }
-#endif
             }
             candidate = std::max(candidate, alignUp(end, alignment));
         }
-#ifdef _WIN32
         if (candidate < _end) {
             if (void* reserved = WindowsMappings::Get().FindAndReserve(candidate, _end, bytes, alignment)) {
                 const auto address = reinterpret_cast<std::uintptr_t>(reserved);
                 _used.emplace(address, address + bytes);
                 return reserved;
             }
+        }
+#else
+            (void)start;
+            (void)end;
+            break;
+        }
+        // Linux: read-write memory at the first free address of the window. A range something
+        // else mapped meanwhile (MAP_FIXED_NOREPLACE fails with EEXIST) is skipped.
+        for (;;) {
+            candidate = alignUp(_base, alignment);
+            for (const auto& [start, end] : _used) {
+                if (candidate < start && bytes <= start - candidate) break;
+                candidate = std::max(candidate, alignUp(end, alignment));
+            }
+            if (candidate >= _end || bytes > _end - candidate) break;
+            void* mapped = mmap(reinterpret_cast<void*>(candidate), bytes, PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+            if (mapped == reinterpret_cast<void*>(candidate)) {
+                _used.emplace(candidate, candidate + bytes);
+                return mapped;
+            }
+            if (mapped != MAP_FAILED) munmap(mapped, bytes); // an old kernel placed it elsewhere
+            else if (errno != EEXIST) throw std::system_error(errno, std::generic_category(), "guest heap mmap");
+            _used.emplace(candidate, candidate + bytes); // someone else's: skipped from now on
         }
 #endif
         throw std::runtime_error("guest address space arena exhausted");
@@ -118,6 +143,10 @@ public:
             if (rangeStart < start) _used.emplace(rangeStart, start);
             if (rangeEnd > end) _used.emplace(end, rangeEnd);
         }
+#ifndef _WIN32
+        // Linux: the heap's own blocks are unmapped (Windows decommits them in GuestArenaReset).
+        if (_base != 0 && start >= _base && end <= _end) munmap(const_cast<void*>(pointer), bytes);
+#endif
     }
 
 private:
@@ -132,6 +161,15 @@ private:
         if (!mappings.ReserveAvailable(PreferredBase, InteropStart) ||
             !mappings.ReserveAvailable(InteropEnd, MapAreaEnd))
             throw std::runtime_error("cannot reserve guest mapping windows around host interop space");
+#else
+        // Linux: the game's heap (malloc) lives in the window Windows keeps for host interop, which
+        // the game never maps itself, so it is guest memory below 2^40 as on Windows: GPU
+        // descriptors can address it and the renderer tracks it. Before, malloc fell back to the
+        // host heap at 47-bit addresses, outside both. libkernel places the game's other mappings
+        // elsewhere in the arena (searching /proc/self/maps), so the window is checked page by
+        // page as it is used.
+        _base = InteropStart;
+        _end = InteropEnd;
 #endif
     }
 
@@ -140,6 +178,7 @@ private:
     std::uintptr_t _base = 0;
     std::uintptr_t _end = 0;
     bool _writeWatched = false;
+
 
 public:
     std::uintptr_t Base() const { return _base; }
