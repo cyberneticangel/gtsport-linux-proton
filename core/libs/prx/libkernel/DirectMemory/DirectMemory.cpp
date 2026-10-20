@@ -836,6 +836,20 @@ bool DirectView(std::uintptr_t address, std::uintptr_t& viewBegin, std::uintptr_
     const std::uintptr_t at = address & ~static_cast<std::uintptr_t>(Page - 1);
     const PhysicalPage* here = pageOf(at);
     if (here == nullptr) return false;
+    // Fast path: a mapping normally lies in one backing (one allocation, whose offsets follow the
+    // physical addresses), and then its first and last pages say so: the view is the mapping.
+    // The renderer asks this for every buffer it binds; walking a 512 MiB mapping page by page
+    // took 13% of its recorder thread in races.
+    const PhysicalPage* head = pageOf(first);
+    const PhysicalPage* tail = pageOf(last - Page);
+    if (head != nullptr && tail != nullptr && head->backing == here->backing && tail->backing == here->backing &&
+        tail->offset - head->offset == last - Page - first && here->offset - head->offset == at - first) {
+        viewBegin = first;
+        viewEnd = last;
+        backing = here->backing.get();
+        backingOffset = head->offset;
+        return true;
+    }
     viewBegin = at;
     while (viewBegin > first) {
         const PhysicalPage* before = pageOf(viewBegin - Page);
