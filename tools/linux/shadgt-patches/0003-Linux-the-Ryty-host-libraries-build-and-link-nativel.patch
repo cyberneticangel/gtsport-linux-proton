@@ -1,0 +1,1456 @@
+From c8635d4441c7dcf2cf0799e6ce6e42917403d85d Mon Sep 17 00:00:00 2001
+From: cyberneticangel <dylan.fantauzzo7@proton.me>
+Date: Mon, 19 Oct 2026 19:34:18 +0200
+Subject: [PATCH 03/12] Linux: the Ryty host libraries build and link natively
+
+- ryty_win32_compat.h/.cpp: the Win32 calls the glue uses, for Linux.
+  VirtualQuery reads a cached snapshot of /proc/self/maps; VirtualProtect
+  is mprotect; guarded copies use process_vm_readv; module handles come
+  from the dynamic loader. GetModuleHandleA(nullptr) is the Windows-layout
+  base (load address - 0x10000), so the game patches' base + 0x10000 +
+  eboot addresses land on the same code.
+- ryty_vendor_linux.cpp: DLSS, DLSS frame generation and FSR 3.1 come as
+  Windows DLLs; on Linux they report themselves unavailable.
+- Red-zone patching (FIX-074) is Windows-only: Linux delivers signals
+  below the 128-byte red zone.
+- Stutter diagnostics, write watches, the heap report and the exception
+  counter are Windows-only (they sample Windows threads and heaps).
+- DllMain becomes a constructor; the first-draw event becomes an
+  exported flag (RytyGpuFirstDrawDone) the save data library polls.
+- Game patch file handling (GTS-005/006) uses std::filesystem on Linux.
+- gen_exports.py: thunks carry their NIDs as global ELF labels (ELF has
+  no .def files). Thunk globals are hidden (PC-relative access).
+- libSceAjm links the system FFmpeg on Linux (the prebuilt archives are
+  not position-independent). ws2_32/iphlpapi only on Windows. The
+  stub copy of sceKernelGetSystemSwVersion stays out of libSceNpAuth.
+---
+ ryty_gpu/RytyGpu.cmake          |  26 ++-
+ ryty_gpu/gen_exports.py         |  13 +-
+ ryty_gpu/ryty_audio3d_shims.cpp |   2 +-
+ ryty_gpu/ryty_core_shims.cpp    |  24 ++-
+ ryty_gpu/ryty_diag.cpp          |  24 ++-
+ ryty_gpu/ryty_dlss.cpp          |   2 +-
+ ryty_gpu/ryty_dlssg.cpp         |   2 +-
+ ryty_gpu/ryty_entry.cpp         |  42 ++++-
+ ryty_gpu/ryty_framegen.cpp      |   2 +-
+ ryty_gpu/ryty_fsr3.cpp          |   2 +-
+ ryty_gpu/ryty_game_patch.cpp    |  99 ++++++++++-
+ ryty_gpu/ryty_input_bridge.cpp  |   2 +-
+ ryty_gpu/ryty_library.cpp       |   5 +
+ ryty_gpu/ryty_np_shims.cpp      |   8 +-
+ ryty_gpu/ryty_red_zone.cpp      |  15 +-
+ ryty_gpu/ryty_stubs.cpp         |  14 +-
+ ryty_gpu/ryty_vendor_linux.cpp  | 120 ++++++++++++++
+ ryty_gpu/ryty_win32_compat.cpp  | 222 +++++++++++++++++++++++++
+ ryty_gpu/ryty_win32_compat.h    | 283 ++++++++++++++++++++++++++++++++
+ ryty_gpu/ryty_write_watch.cpp   |  14 +-
+ 20 files changed, 895 insertions(+), 26 deletions(-)
+ create mode 100644 ryty_gpu/ryty_vendor_linux.cpp
+ create mode 100644 ryty_gpu/ryty_win32_compat.cpp
+ create mode 100644 ryty_gpu/ryty_win32_compat.h
+
+diff --git a/ryty_gpu/RytyGpu.cmake b/ryty_gpu/RytyGpu.cmake
+index 799fa018..28b5584a 100644
+--- a/ryty_gpu/RytyGpu.cmake
++++ b/ryty_gpu/RytyGpu.cmake
+@@ -21,6 +21,7 @@ set(RYTY_COMMON_SOURCES
+     ryty_gpu/ryty_library.cpp
+     ryty_gpu/ryty_core_shims.cpp
+     ryty_gpu/ryty_stubs.cpp
++    ryty_gpu/ryty_win32_compat.cpp
+     src/core/file_format/npbind.cpp
+ )
+ # shadGT's Discord presence is not part of the Ryty build.
+@@ -104,13 +105,15 @@ ryty_add_library(ryty_gpu libSceVideoOut
+         # Stutter diagnostics (RYGT_DIAG=1), ryty_diag.h.
+         ryty_gpu/ryty_diag.cpp
+         # NVIDIA DLSS through the optional plugin dlss\ryGT_dlss.dll (ryty_dlss.h).
+-        ryty_gpu/ryty_dlss.cpp
++        $<$<PLATFORM_ID:Windows>:ryty_gpu/ryty_dlss.cpp>
+         # AMD FSR 3.1 through amd_fidelityfx_vk.dll (ryty_fsr3.h).
+-        ryty_gpu/ryty_fsr3.cpp
++        $<$<PLATFORM_ID:Windows>:ryty_gpu/ryty_fsr3.cpp>
+         # AMD FSR 3.1 frame generation (ryty_framegen.h).
+-        ryty_gpu/ryty_framegen.cpp
++        $<$<PLATFORM_ID:Windows>:ryty_gpu/ryty_framegen.cpp>
+         # NVIDIA DLSS frame generation through Streamline (ryty_dlssg.h).
+-        ryty_gpu/ryty_dlssg.cpp
++        $<$<PLATFORM_ID:Windows>:ryty_gpu/ryty_dlssg.cpp>
++        # Linux: those vendor libraries are Windows DLLs (ryty_vendor_linux.cpp).
++        $<$<NOT:$<PLATFORM_ID:Windows>>:ryty_gpu/ryty_vendor_linux.cpp>
+         # FIX-074: shadGT's static red-zone patching, applied to the converted game code.
+         ryty_gpu/ryty_red_zone.cpp
+         ryty_gpu/ryty_game_patch.cpp
+@@ -156,7 +159,15 @@ ryty_add_library(ryty_ajm libSceAjm
+     HLE_REGISTER Libraries::Ajm::RegisterLib
+     LOG shadgt_ajm.log
+ )
+-target_link_libraries(ryty_ajm PRIVATE LibAtrac9 fdk-aac FFmpeg::ffmpeg minimp3)
++if (WIN32)
++    target_link_libraries(ryty_ajm PRIVATE LibAtrac9 fdk-aac FFmpeg::ffmpeg minimp3)
++else()
++    # Linux: the prebuilt FFmpeg archives are not position-independent, so this shared library
++    # links the system's FFmpeg instead.
++    find_package(PkgConfig REQUIRED)
++    pkg_check_modules(RYTY_FFMPEG REQUIRED IMPORTED_TARGET libavcodec libavutil libswresample)
++    target_link_libraries(ryty_ajm PRIVATE LibAtrac9 fdk-aac PkgConfig::RYTY_FFMPEG minimp3)
++endif()
+ 
+ # shadGT's Audio3d (the SDL-backend version), mixing into Ryty's AudioOut ports.
+ ryty_add_library(ryty_audio3d libSceAudio3d
+@@ -213,5 +224,8 @@ ryty_add_library(ryty_np libSceNpAuth
+             src/core/libraries/network/net_util.cpp
+ )
+ target_compile_definitions(ryty_np PRIVATE RYTY_GUEST_PTHREADS)
+-target_link_libraries(ryty_np PRIVATE libprotobuf Cpp_Httplib minimp3 miniupnpc::miniupnpc ws2_32 iphlpapi)
++target_link_libraries(ryty_np PRIVATE libprotobuf Cpp_Httplib minimp3 miniupnpc::miniupnpc)
++if (WIN32)
++    target_link_libraries(ryty_np PRIVATE ws2_32 iphlpapi)
++endif()
+ target_include_directories(ryty_np PRIVATE "${SHADNET_PROTO_OUT}")
+diff --git a/ryty_gpu/gen_exports.py b/ryty_gpu/gen_exports.py
+index 48948bda..c085a626 100644
+--- a/ryty_gpu/gen_exports.py
++++ b/ryty_gpu/gen_exports.py
+@@ -23,6 +23,10 @@ def main():
+         "#include <cstdint>",
+         "",
+         'extern "C" {',
++        "#ifndef _WIN32",
++        "// Hidden: the thunks address it PC-relative (see ryty_library.cpp).",
++        '__attribute__((visibility("hidden")))',
++        "#endif",
+         f"void* g_ryty_export_targets[{len(nids)}];",
+         f"extern const char* const g_ryty_export_nids[{len(nids)}] = {{",
+     ]
+@@ -36,8 +40,15 @@ def main():
+         '    ".att_syntax prefix\\n"',
+         '    ".text\\n"',
+     ]
+-    for index in range(len(nids)):
++    for index, nid in enumerate(nids):
++        # ELF has no .def file: on Linux the thunk also carries its NID as a global label (quoted,
++        # since NIDs contain '+' and '-').
+         cpp += [
++            "#ifndef _WIN32",
++            f'    ".globl \\"{nid}\\"\\n"',
++            f'    ".type \\"{nid}\\", @function\\n"',
++            f'    "\\"{nid}\\":\\n"',
++            "#endif",
+             f'    ".globl ryty_export_{index}\\n"',
+             f'    "ryty_export_{index}:\\n"',
+             f'    "    leaq g_ryty_export_targets+{index * 8}(%rip), %r11\\n"',
+diff --git a/ryty_gpu/ryty_audio3d_shims.cpp b/ryty_gpu/ryty_audio3d_shims.cpp
+index d48d1e44..2fbedcd3 100644
+--- a/ryty_gpu/ryty_audio3d_shims.cpp
++++ b/ryty_gpu/ryty_audio3d_shims.cpp
+@@ -1,7 +1,7 @@
+ // shadGT's Audio3d mixes the game's 3D audio objects and beds into AudioOut ports. In the Ryty
+ // build the ports belong to Ryty's libSceAudioOut, so the AudioOut calls forward to it by NID.
+ 
+-#include <windows.h>
++#include "ryty_gpu/ryty_win32_compat.h"
+ 
+ #include "common/logging/log.h"
+ #include "core/libraries/audio/audioout.h"
+diff --git a/ryty_gpu/ryty_core_shims.cpp b/ryty_gpu/ryty_core_shims.cpp
+index f6ce68b6..c89713cd 100644
+--- a/ryty_gpu/ryty_core_shims.cpp
++++ b/ryty_gpu/ryty_core_shims.cpp
+@@ -3,7 +3,7 @@
+ // them or to Windows directly.
+ 
+ #include "ryty_gpu/ryty_diag.h"
+-#include <windows.h>
++#include "ryty_gpu/ryty_win32_compat.h"
+ #ifdef _MSC_VER
+ #include <intrin.h>
+ #else
+@@ -467,10 +467,16 @@ static std::optional<GuestRange> GuestRangeOf(VAddr address) {
+         return Arena;
+     }
+     static const GuestRange image = [] {
++#ifdef _WIN32
+         const auto base = reinterpret_cast<VAddr>(GetModuleHandleW(nullptr));
+         const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+         const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+         return GuestRange{base, base + nt->OptionalHeader.SizeOfImage};
++#else
++        std::uintptr_t start = 0, end = 0;
++        RytyCompat::MainImageRange(start, end);
++        return GuestRange{start, end};
++#endif
+     }();
+     if (address >= image.start && address < image.end) {
+         return image;
+@@ -715,6 +721,7 @@ using HashFn = XXH64_hash_t (*)(const void*, size_t);
+ static CopyFn volatile g_guarded_copy = &std::memcpy;
+ static HashFn volatile g_guarded_hash = &XXH3_64bits;
+ 
++#ifdef _WIN32
+ static bool GuardedCopyRaw(void* dest, const void* source, size_t size) {
+     __try {
+         g_guarded_copy(dest, source, size);
+@@ -732,6 +739,21 @@ static bool GuardedHashRaw(const void* source, size_t size, u64* hash) {
+     }
+     return true;
+ }
++#else
++// Linux: the kernel copies and reports an inaccessible page as an error (no fault to handle).
++static bool GuardedCopyRaw(void* dest, const void* source, size_t size) {
++    return RytyCompat::SafeCopy(dest, source, size);
++}
++
++static bool GuardedHashRaw(const void* source, size_t size, u64* hash) {
++    std::vector<u8> copy(size);
++    if (!RytyCompat::SafeCopy(copy.data(), source, size)) {
++        return false;
++    }
++    *hash = g_guarded_hash(copy.data(), size);
++    return true;
++}
++#endif
+ 
+ bool GuardedCopy(void* dest, const void* source, size_t size) {
+     ++g_guarded_reads;
+diff --git a/ryty_gpu/ryty_diag.cpp b/ryty_gpu/ryty_diag.cpp
+index 9156ad42..16fc796b 100644
+--- a/ryty_gpu/ryty_diag.cpp
++++ b/ryty_gpu/ryty_diag.cpp
+@@ -1,8 +1,10 @@
+ // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+-#include <windows.h>
++#include "ryty_gpu/ryty_win32_compat.h"
++#ifdef _WIN32
+ #include <tlhelp32.h>
++#endif
+ 
+ #include <algorithm>
+ #include <array>
+@@ -26,6 +28,7 @@
+ #include "ryty_gpu/ryty_diag.h"
+ #include "video_core/renderdoc.h"
+ 
++#ifdef _WIN32
+ namespace RyDiag {
+ 
+ namespace {
+@@ -1239,3 +1242,22 @@ extern "C" __declspec(dllexport) void RyGtDiagRecordNs(u32 zone, u64 nanos, u64
+         RyDiag::RecordElapsed(RyDiag::Zone(zone), std::chrono::nanoseconds{nanos}, arg);
+     }
+ }
++#else
++// Linux: the stutter diagnostics sample threads through Windows thread contexts, symbols and
++// heaps; RYGT_DIAG is not available here. Zones and the exports Ryty's libraries call are
++// accepted and dropped.
++namespace RyDiag {
++bool Enabled() {
++    return false;
++}
++void Record(Zone, u64, u64, u64) {}
++void RecordElapsed(Zone, std::chrono::steady_clock::duration, u64) {}
++void FrameShown() {}
++} // namespace RyDiag
++
++extern "C" __declspec(dllexport) int RyGtDiagEnabled() {
++    return 0;
++}
++extern "C" __declspec(dllexport) void RyGtDiagRecord(u32, u64, u64, u64) {}
++extern "C" __declspec(dllexport) void RyGtDiagRecordNs(u32, u64, u64) {}
++#endif
+diff --git a/ryty_gpu/ryty_dlss.cpp b/ryty_gpu/ryty_dlss.cpp
+index 48c00705..7c5d5d05 100644
+--- a/ryty_gpu/ryty_dlss.cpp
++++ b/ryty_gpu/ryty_dlss.cpp
+@@ -1,7 +1,7 @@
+ // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+-#include <windows.h>
++#include "ryty_gpu/ryty_win32_compat.h"
+ 
+ #include <algorithm>
+ #include <cstring>
+diff --git a/ryty_gpu/ryty_dlssg.cpp b/ryty_gpu/ryty_dlssg.cpp
+index de205576..dd167330 100644
+--- a/ryty_gpu/ryty_dlssg.cpp
++++ b/ryty_gpu/ryty_dlssg.cpp
+@@ -1,7 +1,7 @@
+ // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+-#include <windows.h>
++#include "ryty_gpu/ryty_win32_compat.h"
+ 
+ #include <array>
+ #include <atomic>
+diff --git a/ryty_gpu/ryty_entry.cpp b/ryty_gpu/ryty_entry.cpp
+index dd8883f7..90187052 100644
+--- a/ryty_gpu/ryty_entry.cpp
++++ b/ryty_gpu/ryty_entry.cpp
+@@ -1,8 +1,10 @@
+ // Entry for the renderer library (libSceVideoOut.prx, which also exports libSceGnmDriver): opens
+ // the window on its own thread, then registers shadGT's Gnm driver and video output.
+ 
+-#include <windows.h>
++#include "ryty_gpu/ryty_win32_compat.h"
++#ifdef _WIN32
+ #include <tlhelp32.h>
++#endif
+ #include <condition_variable>
+ #include <cstdio>
+ #include <algorithm>
+@@ -80,7 +82,11 @@ void RunWindowThread() {
+         window.WaitEvent();
+     }
+     // The window was closed: end the game without DLL teardown (see Emulator::Shutdown).
++#ifdef _WIN32
+     TerminateProcess(GetCurrentProcess(), 0);
++#else
++    _exit(0);
++#endif
+ }
+ 
+ // Signals the named event Ryty's save data library waits on before GT Sport's first save access
+@@ -88,13 +94,25 @@ void RunWindowThread() {
+ // finish before the boot screen is listening for it. Before the boot screen nothing draws: the
+ // save access is held before the game decides to create a save, so its "Saving" indicator, which
+ // would otherwise draw first on a fresh save, has not appeared yet.
++// Linux: the save data library is in the same process and polls RytyGpuFirstDrawDone instead of
++// waiting on a named event.
++std::atomic<bool> g_first_draw_done{false};
++
++extern "C" __declspec(dllexport) bool RytyGpuFirstDrawDone() {
++    return g_first_draw_done.load(std::memory_order_acquire);
++}
++
+ void StartFirstDrawWatcher() {
++#ifdef _WIN32
+     char name[64];
+     std::snprintf(name, sizeof(name), "Local\\RytyFirstDraw-%lu", GetCurrentProcessId());
+     HANDLE event = CreateEventA(nullptr, TRUE, FALSE, name);
+     if (event == nullptr) {
+         return;
+     }
++#else
++    void* event = nullptr;
++#endif
+     std::thread([event] {
+         auto& draws = Common::GetWorkCounters().draws;
+         while (draws.load(std::memory_order_relaxed) == 0) {
+@@ -109,7 +127,12 @@ void StartFirstDrawWatcher() {
+             last = now;
+         }
+         LOG_INFO(Lib_GnmDriver, "Ryty: the boot screen is drawing; releasing the first save access");
++        g_first_draw_done.store(true, std::memory_order_release);
++#ifdef _WIN32
+         SetEvent(event);
++#else
++        (void)event;
++#endif
+     }).detach();
+ }
+ 
+@@ -265,6 +288,7 @@ void DrawFpsCounter() {
+ // first bytes of one block of each size. The walk holds the heap's lock, so nothing it does may
+ // allocate: the table is allocated before.
+ void StartHeapReport() {
++#ifdef _WIN32
+     const char* env = std::getenv("SHADGT_HEAP_REPORT");
+     if (env == nullptr) {
+         return;
+@@ -360,6 +384,9 @@ void StartHeapReport() {
+             }
+         }
+     }).detach();
++#else
++    // DIAG-047 walks the Windows process heaps; there is no Linux counterpart.
++#endif
+ }
+ 
+ } // namespace
+@@ -397,6 +424,7 @@ void Ryty::RytyLibraryInitialize() {
+     StartInputBridge();
+     StartFirstDrawWatcher();
+     StartHeapReport();
++#ifdef _WIN32
+     // DIAG-078: SHADGT_LOG_EXCEPTIONS=1 counts every exception raised in GTSport.exe code (first
+     // chance, any handler) by code and exe offset, and logs the counts every 5 seconds.
+     if (const char* env = std::getenv("SHADGT_LOG_EXCEPTIONS"); env && env[0] == '1') {
+@@ -460,6 +488,7 @@ void Ryty::RytyLibraryInitialize() {
+             }
+         }).detach();
+     }
++#endif
+     // DIAG-075: SHADGT_WATCH_WRITE=<hex address>:<seconds>:<ms>[;...] logs the writes to a guest
+     // address (thread, code address, value) for ms milliseconds, seconds after the renderer
+     // starts; several watches run one after another.
+@@ -545,6 +574,7 @@ void RytyApplyGamePatches();     // ryty_game_patch.cpp (GTS-001)
+ 
+ // Ryty loads this library before the game's code starts, so the game code can still be patched
+ // safely here (FIX-074).
++#ifdef _WIN32
+ extern "C" BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
+     if (reason == DLL_PROCESS_ATTACH) {
+         // ryGT: overlay layers (OBS, Steam) hook Vulkan and have hung the game on exit. The
+@@ -557,7 +587,16 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
+     }
+     return TRUE;
+ }
++#else
++// Linux: the same when the dynamic loader loads the library, before the game's code starts.
++__attribute__((constructor)) static void RytyGpuLoaded() {
++    setenv("VK_LOADER_LAYERS_DISABLE", "~implicit~", 0);
++    RytyProtectGuestRedZones();
++    RytyApplyGamePatches();
++}
++#endif
+ 
++#ifdef _WIN32
+ // The renderer write-protects guest pages it caches on the GPU. Ryty's exception handler offers
+ // each guest write fault here first; true means the renderer owned the page, dropped its cached
+ // copy and unprotected it, so the write can be retried.
+@@ -609,6 +648,7 @@ extern "C" __declspec(dllexport) int RytyGpuHandleWriteFault(void* exception_poi
+     }
+     return Core::RytyMemory::InGuardedRead() ? 2 : 0;
+ }
++#endif
+ 
+ // FIX-044 for Ryty: the guest's TSC, which stands still while the GPU command thread compiles
+ // shaders or pipelines (common/guest_clock.h). Ryty's libkernel derives the game's monotonic clocks
+diff --git a/ryty_gpu/ryty_framegen.cpp b/ryty_gpu/ryty_framegen.cpp
+index f244eab5..b8310548 100644
+--- a/ryty_gpu/ryty_framegen.cpp
++++ b/ryty_gpu/ryty_framegen.cpp
+@@ -1,7 +1,7 @@
+ // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+-#include <windows.h>
++#include "ryty_gpu/ryty_win32_compat.h"
+ 
+ #include <algorithm>
+ #include <array>
+diff --git a/ryty_gpu/ryty_fsr3.cpp b/ryty_gpu/ryty_fsr3.cpp
+index 1d35123e..3228ec24 100644
+--- a/ryty_gpu/ryty_fsr3.cpp
++++ b/ryty_gpu/ryty_fsr3.cpp
+@@ -1,7 +1,7 @@
+ // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+-#include <windows.h>
++#include "ryty_gpu/ryty_win32_compat.h"
+ 
+ #include <algorithm>
+ #include <array>
+diff --git a/ryty_gpu/ryty_game_patch.cpp b/ryty_gpu/ryty_game_patch.cpp
+index d826df7b..6c73415f 100644
+--- a/ryty_gpu/ryty_game_patch.cpp
++++ b/ryty_gpu/ryty_game_patch.cpp
+@@ -9,6 +9,7 @@
+ // experiments (RVA in GTSport.exe: eboot.bin address + 0x10000).
+ 
+ #include <cstdio>
++#include <filesystem>
+ #include <algorithm>
+ #include <atomic>
+ #include <chrono>
+@@ -22,7 +23,7 @@
+ #include <thread>
+ #include <unordered_set>
+ #include <vector>
+-#include <windows.h>
++#include "ryty_gpu/ryty_win32_compat.h"
+ #include <fmt/format.h>
+ 
+ #include "common/perf_monitor.h"
+@@ -355,9 +356,13 @@ void PS4_SYSV_ABI MiscCtorHook(void* self) {
+ 
+ // Memory for jump stubs within +-2 GB of the game's code, so its rel32 calls can reach them.
+ u8* AllocNear(u8* base) {
++#ifdef _WIN32
+     SYSTEM_INFO system{};
+     GetSystemInfo(&system);
+     const u64 granularity = system.dwAllocationGranularity;
++#else
++    const u64 granularity = static_cast<u64>(sysconf(_SC_PAGESIZE));
++#endif
+     for (u64 distance = granularity; distance < (1ULL << 30); distance += granularity) {
+         for (const s64 sign : {-1, 1}) {
+             const u64 address =
+@@ -544,6 +549,7 @@ void ServeReplacement(void* file, u8* begin, s64 read) {
+     }
+ }
+ 
++#ifdef _WIN32
+ void LoadScriptReplacements() {
+     char exe[MAX_PATH] = {};
+     GetModuleFileNameA(nullptr, exe, MAX_PATH);
+@@ -573,6 +579,37 @@ void LoadScriptReplacements() {
+     } while (FindNextFileA(find, &found));
+     FindClose(find);
+ }
++#else
++// Linux: <exe dir>/patches/scripts/*.ADC, as on Windows.
++void LoadScriptReplacements() {
++    char exe[MAX_PATH] = {};
++    GetModuleFileNameA(nullptr, exe, MAX_PATH);
++    const std::filesystem::path dir =
++        std::filesystem::path{exe}.parent_path() / "patches" / "scripts";
++    std::error_code error;
++    for (const auto& entry : std::filesystem::directory_iterator(dir, error)) {
++        if (!entry.is_regular_file() || entry.path().extension() != ".ADC") {
++            continue;
++        }
++        const std::string name = entry.path().filename().string();
++        FILE* f = std::fopen(entry.path().c_str(), "rb");
++        if (!f) {
++            continue;
++        }
++        ScriptReplacement replacement{name, {}};
++        std::fseek(f, 0, SEEK_END);
++        replacement.data.resize(static_cast<size_t>(std::ftell(f)));
++        std::fseek(f, 0, SEEK_SET);
++        const size_t got = std::fread(replacement.data.data(), 1, replacement.data.size(), f);
++        std::fclose(f);
++        if (got == replacement.data.size() && got >= 128) {
++            std::fprintf(stderr, "[patch] GTS-005 script replacement %s (%zu bytes)\n",
++                         name.c_str(), got);
++            g_script_replacements.push_back(std::move(replacement));
++        }
++    }
++}
++#endif
+ 
+ // FIX-110: whether a race (a race_* project) or the menus (gtmode, arcade and the other menu
+ // projects) run, from the project script the game loads when it switches. Overlays a race loads
+@@ -593,12 +630,22 @@ void NoteProjectScript(const u8* data, s64 read) {
+     std::string_view name = head.substr(at + 15);
+     if (std::getenv("RYGT_LOG_PROJECTS")) {
+         // DIAG-135: every project script the game loads, with the time.
++        const std::string_view path = name.substr(0, name.find_first_of(".\0", 0));
++#ifdef _WIN32
+         SYSTEMTIME now;
+         GetLocalTime(&now);
+-        const std::string_view path = name.substr(0, name.find_first_of(".\0", 0));
+         std::fprintf(stderr, "[projects] %02d:%02d:%02d.%03d %.*s\n", now.wHour, now.wMinute,
+                      now.wSecond, now.wMilliseconds, static_cast<int>(std::min<size_t>(path.size(), 80)),
+                      path.data());
++#else
++        timespec now{};
++        clock_gettime(CLOCK_REALTIME, &now);
++        tm local{};
++        localtime_r(&now.tv_sec, &local);
++        std::fprintf(stderr, "[projects] %02d:%02d:%02d.%03ld %.*s\n", local.tm_hour, local.tm_min,
++                     local.tm_sec, now.tv_nsec / 1000000,
++                     static_cast<int>(std::min<size_t>(path.size(), 80)), path.data());
++#endif
+     }
+     name = name.substr(0, name.find('/'));
+     static constexpr std::string_view menus[] = {
+@@ -842,6 +889,7 @@ void InstallTextEntryDiag(u8* base) {
+ // game's <exe dir>\temp0\decals) as "<id>_<name>.svg"; the patched GRIM script lists them as the
+ // user's decals and copies each into the decal cache under that id. The id is a hash of the file
+ // name, so a decal keeps its id (and liveries that use it keep working) across runs.
++#ifdef _WIN32
+ void SyncDecals() {
+     wchar_t exe[MAX_PATH] = {};
+     GetModuleFileNameW(nullptr, exe, MAX_PATH);
+@@ -888,6 +936,46 @@ void SyncDecals() {
+     FindClose(find);
+     std::fprintf(stderr, "[patch] GTS-006 %d custom decal(s) from decals\\\n", count);
+ }
++#else
++// Linux: <exe dir>/decals/*.svg to <exe dir>/temp0/decals, named as on Windows.
++void SyncDecals() {
++    char exe[MAX_PATH] = {};
++    GetModuleFileNameA(nullptr, exe, MAX_PATH);
++    const std::filesystem::path dir = std::filesystem::path{exe}.parent_path();
++    const std::filesystem::path src = dir / "decals";
++    const std::filesystem::path dst = dir / "temp0" / "decals";
++    std::error_code error;
++    std::filesystem::create_directories(src, error);
++    std::filesystem::create_directories(dst, error);
++    for (const auto& entry : std::filesystem::directory_iterator(dst, error)) {
++        if (entry.path().extension() == ".svg") {
++            std::filesystem::remove(entry.path(), error);
++        }
++    }
++    int count = 0;
++    for (const auto& entry : std::filesystem::directory_iterator(src, error)) {
++        if (!entry.is_regular_file() || entry.path().extension() != ".svg") {
++            continue;
++        }
++        const std::string file = entry.path().filename().string();
++        u32 hash = 2166136261u;
++        std::string title;
++        for (const char c : file.substr(0, file.size() - 4)) {
++            const auto byte = static_cast<unsigned char>(c);
++            hash = (hash ^ static_cast<u32>(std::tolower(byte))) * 16777619u;
++            title += (byte < 128 && (std::isalnum(byte) || c == ' ' || c == '-' || c == '_'))
++                         ? c : '_';
++        }
++        const u32 id = 2000000000u + hash % 100000000u;
++        const std::string name = std::to_string(id) + "_" + title + ".svg";
++        if (std::filesystem::copy_file(entry.path(), dst / name,
++                                       std::filesystem::copy_options::overwrite_existing, error)) {
++            ++count;
++        }
++    }
++    std::fprintf(stderr, "[patch] GTS-006 %d custom decal(s) from decals/\n", count);
++}
++#endif
+ 
+ // GTS-007: wet-road reflections off. In the rain GT Sport renders the scene a second time into a
+ // 1024x512 reflection of the wet track (ReflectSetting.enableIfWet of the course settings, checked
+@@ -1008,12 +1096,11 @@ void RytyApplyGamePatches() {
+         SyncDecals();
+     }
+     auto* base = reinterpret_cast<u8*>(GetModuleHandleA(nullptr));
+-    char buffer[4096];
+-    const DWORD length = GetEnvironmentVariableA("RYGT_PATCH", buffer, sizeof(buffer));
+-    if (length == 0 || length >= sizeof(buffer)) {
++    const char* patch_list = std::getenv("RYGT_PATCH");
++    if (patch_list == nullptr || *patch_list == '\0' || std::strlen(patch_list) >= 4096) {
+         return;
+     }
+-    std::string list{buffer, length};
++    std::string list{patch_list};
+     size_t start = 0;
+     while (start < list.size()) {
+         const size_t end = std::min(list.find(',', start), list.size());
+diff --git a/ryty_gpu/ryty_input_bridge.cpp b/ryty_gpu/ryty_input_bridge.cpp
+index e3631f3b..6f568d8c 100644
+--- a/ryty_gpu/ryty_input_bridge.cpp
++++ b/ryty_gpu/ryty_input_bridge.cpp
+@@ -2,7 +2,7 @@
+ // states (keyboard bindings and SDL gamepads), and this thread forwards them to Ryty's libScePad,
+ // which is what the game reads. The game's rumble and light bar requests travel back the same way.
+ 
+-#include <windows.h>
++#include "ryty_gpu/ryty_win32_compat.h"
+ #include <algorithm>
+ #include <array>
+ #include <atomic>
+diff --git a/ryty_gpu/ryty_library.cpp b/ryty_gpu/ryty_library.cpp
+index f281a7b5..86a2dc44 100644
+--- a/ryty_gpu/ryty_library.cpp
++++ b/ryty_gpu/ryty_library.cpp
+@@ -21,6 +21,11 @@ extern "C" {
+ extern void* g_ryty_export_targets[];
+ extern const char* const g_ryty_export_nids[];
+ extern const unsigned g_ryty_export_count;
++// Hidden: the entry thunk reads it PC-relative, which ELF shared libraries allow only for symbols
++// that cannot be preempted (on Windows every DLL symbol is local).
++#ifndef _WIN32
++__attribute__((visibility("hidden")))
++#endif
+ volatile unsigned char g_ryty_library_ready = 0;
+ void RytyLibraryEnsureInit();
+ }
+diff --git a/ryty_gpu/ryty_np_shims.cpp b/ryty_gpu/ryty_np_shims.cpp
+index f3bcb778..da5f41cc 100644
+--- a/ryty_gpu/ryty_np_shims.cpp
++++ b/ryty_gpu/ryty_np_shims.cpp
+@@ -3,9 +3,15 @@
+ // by NID. The NP bundle runs offline, so the network, HTTP and overlay calls report failure or do
+ // nothing.
+ 
++#ifdef _WIN32
+ #include <winsock2.h>
+ #include <ws2tcpip.h>
+-#include <windows.h>
++#else
++#include <arpa/inet.h>
++#include <netinet/in.h>
++#include <sys/socket.h>
++#endif
++#include "ryty_gpu/ryty_win32_compat.h"
+ #include <atomic>
+ #include <cstdio>
+ #include <string>
+diff --git a/ryty_gpu/ryty_red_zone.cpp b/ryty_gpu/ryty_red_zone.cpp
+index bff59487..6fff54e3 100644
+--- a/ryty_gpu/ryty_red_zone.cpp
++++ b/ryty_gpu/ryty_red_zone.cpp
+@@ -14,7 +14,7 @@
+ // comes from the game's own EH frame header, which Ryty keeps in the executable and records in
+ // its .ehmeta section.
+ 
+-#include <windows.h>
++#include "ryty_gpu/ryty_win32_compat.h"
+ 
+ #include <cstdio>
+ #include <cstdlib>
+@@ -25,6 +25,7 @@
+ #include "core/cpu_patches.h"
+ #include "core/loader/dwarf.h"
+ 
++#ifdef _WIN32
+ namespace {
+ 
+ struct Section {
+@@ -61,6 +62,17 @@ u8* AllocateTrampolines(u8* image_base, u64 image_size, u64 size) {
+ 
+ } // namespace
+ 
++#else
++// Linux delivers signals below the 128-byte red zone of the interrupted code (the x86-64 System V
++// ABI's guarantee), so page-tracking faults do not overwrite the game's red-zone data and its
++// memory instructions need no patching. On Windows the exception dispatch writes right below the
++// stack pointer (FIX-074).
++void RytyProtectGuestRedZones() {
++    std::fprintf(stderr, "[ryty_gpu] FIX-074: not needed on Linux (signals keep the red zone)\n");
++}
++#endif
++
++#ifdef _WIN32
+ void RytyProtectGuestRedZones() {
+     if (const char* env = std::getenv("RYTY_RED_ZONE_PATCH"); env && env[0] == '0') {
+         std::fprintf(stderr, "[ryty_gpu] FIX-074: red-zone patching is off (RYTY_RED_ZONE_PATCH=0)\n");
+@@ -125,3 +137,4 @@ void RytyProtectGuestRedZones() {
+                  static_cast<unsigned long long>(result.unrelocatable_memory_instruction_count));
+     std::fflush(stderr);
+ }
++#endif
+diff --git a/ryty_gpu/ryty_stubs.cpp b/ryty_gpu/ryty_stubs.cpp
+index 496ab681..9b66d267 100644
+--- a/ryty_gpu/ryty_stubs.cpp
++++ b/ryty_gpu/ryty_stubs.cpp
+@@ -4,7 +4,7 @@
+ #include <cstdio>
+ #include "core/libraries/kernel/kernel.h"
+ #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+-#include <windows.h>
++#include "ryty_gpu/ryty_win32_compat.h"
+ #include <algorithm>
+ #include <atomic>
+ #include <cctype>
+@@ -97,7 +97,11 @@ Emulator::~Emulator() = default;
+ 
+ void Emulator::Shutdown() {
+     // Skip DLL_PROCESS_DETACH: the GPU driver's teardown can deadlock when the exit starts here.
++#ifdef _WIN32
+     TerminateProcess(GetCurrentProcess(), 0);
++#else
++    _exit(0);
++#endif
+ }
+ 
+ std::string MemoryManager::DescribeAddress(VAddr addr) {
+@@ -147,7 +151,11 @@ namespace Libraries::Kernel {
+ // Guest signals are handled by Ryty; the renderer's fault handler never forwards to the guest.
+ thread_local Pthread* g_curthread = nullptr;
+ 
++#ifdef _WIN32
+ Ucontext::Ucontext(PCONTEXT context) : host_context(context) {}
++#else
++Ucontext::Ucontext(siginfo_t const*, ucontext_t* raw_context) : host_context(raw_context) {}
++#endif
+ 
+ bool Pthread::DispatchSignal(s32, Siginfo*, Ucontext*) {
+     return false;
+@@ -169,6 +177,9 @@ Common::NativeClock* GetClock() {
+ } // namespace Dev
+ 
+ // ryGT: for the on-screen keyboard dialog (its panel size depends on the firmware version).
++// libSceNpAuth (RYTY_GUEST_PTHREADS) has its own in ryty_np_shims.cpp; ELF linkers reject the
++// duplicate.
++#ifndef RYTY_GUEST_PTHREADS
+ s32 PS4_SYSV_ABI sceKernelGetSystemSwVersion(SwVersionStruct* ret) {
+     if (ret != nullptr) {
+         constexpr u32 firmware = 0x09000000;
+@@ -178,6 +189,7 @@ s32 PS4_SYSV_ABI sceKernelGetSystemSwVersion(SwVersionStruct* ret) {
+     }
+     return 0;
+ }
++#endif
+ 
+ } // namespace Libraries::Kernel
+ 
+diff --git a/ryty_gpu/ryty_vendor_linux.cpp b/ryty_gpu/ryty_vendor_linux.cpp
+new file mode 100644
+index 00000000..a5ee3a98
+--- /dev/null
++++ b/ryty_gpu/ryty_vendor_linux.cpp
+@@ -0,0 +1,120 @@
++// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++// Linux builds: NVIDIA DLSS and DLSS frame generation (Streamline) and AMD's FidelityFX API
++// (FSR 3.1 upscaling and frame generation) come as Windows DLLs, so they are unavailable here.
++// Each reports itself so and passes the image through; the renderer's own FSR 1 upscaling still
++// works. Windows builds use ryty_dlss.cpp, ryty_dlssg.cpp, ryty_fsr3.cpp and ryty_framegen.cpp.
++
++#include "ryty_gpu/ryty_dlss.h"
++#include "ryty_gpu/ryty_dlssg.h"
++#include "ryty_gpu/ryty_framegen.h"
++#include "ryty_gpu/ryty_fsr3.h"
++
++namespace Vulkan::RytyDlss {
++
++bool Load() {
++    return false;
++}
++
++void AddInstanceExtensions(std::vector<const char*>&, const std::vector<vk::ExtensionProperties>&) {}
++
++void AddDeviceExtensions(vk::Instance, vk::PhysicalDevice,
++                         const std::function<bool(std::string_view)>&) {}
++
++bool Init(vk::Instance, vk::PhysicalDevice, vk::Device) {
++    return false;
++}
++
++void Shutdown() {}
++
++void Pass::Create(vk::Device device_, VmaAllocator, u32) {
++    device = device_;
++    failed = true;
++}
++
++vk::ImageView Pass::Render(vk::CommandBuffer, vk::Image, vk::ImageView input, vk::Format,
++                           vk::Extent2D, vk::Extent2D) {
++    return input;
++}
++
++} // namespace Vulkan::RytyDlss
++
++namespace Vulkan::RytyDlssG {
++
++bool Requested() {
++    return false;
++}
++
++PFN_vkGetInstanceProcAddr LoadInterposer() {
++    return nullptr;
++}
++
++bool Active() {
++    return false;
++}
++
++void Prepare(vk::Device, VmaAllocator, vk::CommandBuffer, vk::Extent2D) {}
++void PresentStart() {}
++void PresentEnd() {}
++void Shutdown() {}
++
++} // namespace Vulkan::RytyDlssG
++
++namespace Vulkan::RytyFsr3 {
++
++Pass::~Pass() = default;
++
++void Pass::Create(vk::Instance, vk::PhysicalDevice physical_device_, vk::Device device_,
++                  VmaAllocator allocator_, u32) {
++    physical_device = physical_device_;
++    device = device_;
++    allocator = allocator_;
++    failed = true;
++}
++
++vk::ImageView Pass::Render(vk::CommandBuffer, vk::Image, vk::ImageView input, vk::Format,
++                           vk::Extent2D, vk::Extent2D, float, bool) {
++    return input;
++}
++
++PFN_vkGetDeviceProcAddr DeviceProcAddrShim() {
++    return nullptr;
++}
++
++} // namespace Vulkan::RytyFsr3
++
++namespace Vulkan::RytyFrameGen {
++
++FrameGen::~FrameGen() = default;
++
++bool FrameGen::CreateSwapchain(const Instance&, const vk::SwapchainCreateInfoKHR&,
++                               vk::SwapchainKHR&) {
++    return false; // the presenter makes an ordinary swapchain
++}
++
++void FrameGen::Destroy() {}
++
++vk::Result FrameGen::GetImages(vk::Device, vk::SwapchainKHR, std::vector<vk::Image>&) const {
++    return vk::Result::eErrorFeatureNotPresent;
++}
++
++vk::Result FrameGen::Acquire(vk::Device, vk::SwapchainKHR, vk::Semaphore, u32*) const {
++    return vk::Result::eErrorFeatureNotPresent;
++}
++
++vk::Result FrameGen::Present(vk::Queue, const vk::PresentInfoKHR&) const {
++    return vk::Result::eErrorFeatureNotPresent;
++}
++
++void FrameGen::Prepare(vk::CommandBuffer, vk::SwapchainKHR, vk::Extent2D, bool) {}
++
++bool Requested() {
++    return false;
++}
++
++u64 ShownFrames() {
++    return 0;
++}
++
++} // namespace Vulkan::RytyFrameGen
+diff --git a/ryty_gpu/ryty_win32_compat.cpp b/ryty_gpu/ryty_win32_compat.cpp
+new file mode 100644
+index 00000000..49de2268
+--- /dev/null
++++ b/ryty_gpu/ryty_win32_compat.cpp
+@@ -0,0 +1,222 @@
++// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++// Linux side of ryty_win32_compat.h.
++
++#ifndef _WIN32
++
++#include <algorithm>
++#include <atomic>
++#include <cerrno>
++#include <cstdio>
++#include <mutex>
++#include <vector>
++#include <fcntl.h>
++#include <link.h>
++#include <sys/uio.h>
++
++#include "ryty_gpu/ryty_win32_compat.h"
++
++namespace RytyCompat {
++namespace {
++
++struct Mapping {
++    std::uintptr_t start;
++    std::uintptr_t end;
++    int prot;
++    bool shared;
++};
++
++// A sorted snapshot of /proc/self/maps. Reading the file costs about as much as the process has
++// mappings (GT Sport has tens of thousands), so lookups search the snapshot and it is read again
++// only after a change made here, when a lookup misses, or when it is older than MaxAgeNs (the
++// runtime maps and unmaps guest memory without telling the renderer).
++struct Snapshot {
++    std::mutex mutex;
++    std::vector<Mapping> mappings;
++    std::uint64_t read_at_ns = 0;
++    std::atomic<bool> stale{true};
++};
++
++constexpr std::uint64_t MaxAgeNs = 100'000'000;
++
++Snapshot& GetSnapshot() {
++    static Snapshot snapshot;
++    return snapshot;
++}
++
++std::uint64_t NowNs() {
++    timespec now{};
++    clock_gettime(CLOCK_MONOTONIC, &now);
++    return static_cast<std::uint64_t>(now.tv_sec) * 1'000'000'000 + now.tv_nsec;
++}
++
++void ReadMappings(std::vector<Mapping>& out) {
++    out.clear();
++    FILE* file = std::fopen("/proc/self/maps", "re");
++    if (file == nullptr) {
++        return;
++    }
++    char line[512];
++    while (std::fgets(line, sizeof(line), file)) {
++        unsigned long start = 0, end = 0;
++        char perms[5] = {};
++        if (std::sscanf(line, "%lx-%lx %4s", &start, &end, perms) != 3) {
++            continue;
++        }
++        int prot = PROT_NONE;
++        prot |= perms[0] == 'r' ? PROT_READ : 0;
++        prot |= perms[1] == 'w' ? PROT_WRITE : 0;
++        prot |= perms[2] == 'x' ? PROT_EXEC : 0;
++        out.push_back({start, end, prot, perms[3] == 's'});
++    }
++    std::fclose(file);
++}
++
++const Mapping* Find(const std::vector<Mapping>& mappings, std::uintptr_t address) {
++    auto it = std::upper_bound(mappings.begin(), mappings.end(), address,
++                               [](std::uintptr_t a, const Mapping& m) { return a < m.start; });
++    if (it == mappings.begin()) {
++        return nullptr;
++    }
++    --it;
++    return address < it->end ? &*it : nullptr;
++}
++
++} // namespace
++
++int ProtFromPage(DWORD page) {
++    switch (page & 0xFF) {
++    case PAGE_READONLY:
++        return PROT_READ;
++    case PAGE_READWRITE:
++    case PAGE_WRITECOPY:
++        return PROT_READ | PROT_WRITE;
++    case PAGE_EXECUTE:
++        return PROT_EXEC;
++    case PAGE_EXECUTE_READ:
++        return PROT_READ | PROT_EXEC;
++    case PAGE_EXECUTE_READWRITE:
++    case PAGE_EXECUTE_WRITECOPY:
++        return PROT_READ | PROT_WRITE | PROT_EXEC;
++    default:
++        return PROT_NONE;
++    }
++}
++
++DWORD PageFromProt(int prot) {
++    const bool r = prot & PROT_READ, w = prot & PROT_WRITE, x = prot & PROT_EXEC;
++    if (x) {
++        return w ? PAGE_EXECUTE_READWRITE : (r ? PAGE_EXECUTE_READ : PAGE_EXECUTE);
++    }
++    return w ? PAGE_READWRITE : (r ? PAGE_READONLY : PAGE_NOACCESS);
++}
++
++void MappingsChanged() {
++    GetSnapshot().stale.store(true, std::memory_order_release);
++}
++
++bool QueryMapping(std::uintptr_t address, MEMORY_BASIC_INFORMATION& info) {
++    constexpr std::uintptr_t UserEnd = 0x0000800000000000ULL;
++    if (address >= UserEnd) {
++        return false;
++    }
++    auto& snapshot = GetSnapshot();
++    std::scoped_lock lk{snapshot.mutex};
++    const std::uint64_t now = NowNs();
++    bool fresh = false;
++    if (snapshot.stale.exchange(false, std::memory_order_acq_rel) ||
++        now - snapshot.read_at_ns > MaxAgeNs) {
++        ReadMappings(snapshot.mappings);
++        snapshot.read_at_ns = now;
++        fresh = true;
++    }
++    const Mapping* mapping = Find(snapshot.mappings, address);
++    if (mapping == nullptr && !fresh) {
++        ReadMappings(snapshot.mappings); // mapped since the snapshot was taken?
++        snapshot.read_at_ns = now;
++        mapping = Find(snapshot.mappings, address);
++    }
++    info = {};
++    if (mapping != nullptr) {
++        info.BaseAddress = reinterpret_cast<void*>(mapping->start);
++        info.AllocationBase = info.BaseAddress;
++        info.RegionSize = mapping->end - mapping->start;
++        info.State = MEM_COMMIT;
++        info.Protect = PageFromProt(mapping->prot);
++        info.AllocationProtect = info.Protect;
++        return true;
++    }
++    // A gap: from the address to the next mapping (or the end of the user address space).
++    auto next = std::upper_bound(snapshot.mappings.begin(), snapshot.mappings.end(), address,
++                                 [](std::uintptr_t a, const Mapping& m) { return a < m.start; });
++    const std::uintptr_t page = static_cast<std::uintptr_t>(sysconf(_SC_PAGESIZE));
++    const std::uintptr_t base = address & ~(page - 1);
++    const std::uintptr_t end = next != snapshot.mappings.end() ? next->start : UserEnd;
++    info.BaseAddress = reinterpret_cast<void*>(base);
++    info.RegionSize = end - base;
++    info.State = MEM_FREE;
++    info.Protect = PAGE_NOACCESS;
++    return true;
++}
++
++void MainImageRange(std::uintptr_t& start, std::uintptr_t& end) {
++    struct Range {
++        std::uintptr_t start = ~std::uintptr_t{0};
++        std::uintptr_t end = 0;
++    } range;
++    dl_iterate_phdr(
++        [](dl_phdr_info* info, size_t, void* data) -> int {
++            // The first object is the main executable.
++            auto* r = static_cast<Range*>(data);
++            for (int i = 0; i < info->dlpi_phnum; ++i) {
++                const auto& ph = info->dlpi_phdr[i];
++                if (ph.p_type != PT_LOAD) {
++                    continue;
++                }
++                r->start = std::min<std::uintptr_t>(r->start, info->dlpi_addr + ph.p_vaddr);
++                r->end = std::max<std::uintptr_t>(r->end, info->dlpi_addr + ph.p_vaddr + ph.p_memsz);
++            }
++            return 1;
++        },
++        &range);
++    start = range.start;
++    end = range.end;
++}
++
++std::uintptr_t MainImageBias() {
++    static const std::uintptr_t bias = [] {
++        std::uintptr_t result = 0;
++        dl_iterate_phdr(
++            [](dl_phdr_info* info, size_t, void* data) -> int {
++                *static_cast<std::uintptr_t*>(data) = info->dlpi_addr; // the main executable
++                return 1;
++            },
++            &result);
++        return result;
++    }();
++    return bias;
++}
++
++bool SafeCopy(void* dest, const void* source, std::size_t size) {
++    // process_vm_readv on this process checks both ranges and fails with EFAULT instead of
++    // faulting, as __try/__except around a memcpy does on Windows.
++    iovec local{dest, size};
++    iovec remote{const_cast<void*>(source), size};
++    return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == static_cast<ssize_t>(size);
++}
++
++bool WriteIgnoringProtection(void* dest, const void* source, std::size_t size) {
++    // Writes through /proc/self/mem go to the pages whatever their protection (the kernel forces
++    // them), so write tracking's protections stay as they are and no fault is raised.
++    static const int memory = open("/proc/self/mem", O_RDWR | O_CLOEXEC);
++    if (memory < 0) {
++        return false;
++    }
++    return pwrite(memory, source, size, static_cast<off_t>(reinterpret_cast<std::uintptr_t>(dest))) ==
++           static_cast<ssize_t>(size);
++}
++
++} // namespace RytyCompat
++
++#endif // !_WIN32
+diff --git a/ryty_gpu/ryty_win32_compat.h b/ryty_gpu/ryty_win32_compat.h
+new file mode 100644
+index 00000000..485a7f50
+--- /dev/null
++++ b/ryty_gpu/ryty_win32_compat.h
+@@ -0,0 +1,283 @@
++// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++// The handful of Win32 calls the Ryty glue (ryty_gpu/*) uses, for Linux builds of the Ryty host
++// libraries. Memory queries come from the process's own mappings, protections from mprotect,
++// modules from the dynamic loader. Windows builds include <windows.h> instead.
++
++#pragma once
++
++#ifdef _WIN32
++#include <windows.h>
++#else
++
++#include <cerrno>
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <ctime>
++#include <string>
++#include <vector>
++#include <algorithm>
++#include <dlfcn.h>
++#include <pthread.h>
++#include <sys/mman.h>
++#include <sys/syscall.h>
++#include <unistd.h>
++
++using DWORD = std::uint32_t;
++using WORD = std::uint16_t;
++using LONG = std::int32_t;
++using BOOL = int;
++using BYTE = std::uint8_t;
++using ULONG_PTR = std::uintptr_t;
++using SIZE_T = std::size_t;
++using HANDLE = void*;
++using HMODULE = void*;
++using FARPROC = void*;
++using LPVOID = void*;
++using LPCVOID = const void*;
++
++// __declspec(dllexport) marks the libraries' exports; on Linux, symbols with default visibility.
++#define __declspec(x) __attribute__((visibility("default")))
++
++#ifndef TRUE
++#define TRUE 1
++#define FALSE 0
++#endif
++
++inline constexpr DWORD MAX_PATH = 4096;
++
++inline constexpr DWORD PAGE_NOACCESS = 0x01;
++inline constexpr DWORD PAGE_READONLY = 0x02;
++inline constexpr DWORD PAGE_READWRITE = 0x04;
++inline constexpr DWORD PAGE_WRITECOPY = 0x08;
++inline constexpr DWORD PAGE_EXECUTE = 0x10;
++inline constexpr DWORD PAGE_EXECUTE_READ = 0x20;
++inline constexpr DWORD PAGE_EXECUTE_READWRITE = 0x40;
++inline constexpr DWORD PAGE_EXECUTE_WRITECOPY = 0x80;
++inline constexpr DWORD PAGE_GUARD = 0x100;
++
++inline constexpr DWORD MEM_COMMIT = 0x1000;
++inline constexpr DWORD MEM_RESERVE = 0x2000;
++inline constexpr DWORD MEM_FREE = 0x10000;
++inline constexpr DWORD MEM_RELEASE = 0x8000;
++
++/// One mapping of the process, as VirtualQuery describes a region: a Linux mapping has a single
++/// protection, so the region and the allocation are the mapping.
++struct MEMORY_BASIC_INFORMATION {
++    void* BaseAddress;
++    void* AllocationBase;
++    DWORD AllocationProtect;
++    SIZE_T RegionSize;
++    DWORD State;
++    DWORD Protect;
++    DWORD Type;
++};
++
++namespace RytyCompat {
++/// The mapping containing address (State MEM_COMMIT), or the gap up to the next mapping
++/// (State MEM_FREE). Returns false only above the user address space.
++bool QueryMapping(std::uintptr_t address, MEMORY_BASIC_INFORMATION& info);
++/// Forgets the cached mappings (after the process maps or unmaps memory).
++void MappingsChanged();
++/// The PROT_* bits for a PAGE_* value, and back.
++int ProtFromPage(DWORD page);
++DWORD PageFromProt(int prot);
++/// The range [start, end) of the main executable's loaded image.
++void MainImageRange(std::uintptr_t& start, std::uintptr_t& end);
++/// Where the main executable is loaded: the address of its virtual address 0.
++std::uintptr_t MainImageBias();
++/// Ryty's Windows converter places the game's code and data 0x10000 above the executable's base
++/// (the renderer's kTextRvaShift); the Linux converter keeps them at their own virtual addresses.
++inline constexpr std::uintptr_t WindowsTextShift = 0x10000;
++/// Copies size bytes, false (and no fault) when part of either range is not accessible.
++bool SafeCopy(void* dest, const void* source, std::size_t size);
++/// Writes size bytes into this process's memory regardless of page protections.
++bool WriteIgnoringProtection(void* dest, const void* source, std::size_t size);
++} // namespace RytyCompat
++
++inline SIZE_T VirtualQuery(LPCVOID address, MEMORY_BASIC_INFORMATION* info, SIZE_T size) {
++    if (size < sizeof(MEMORY_BASIC_INFORMATION) ||
++        !RytyCompat::QueryMapping(reinterpret_cast<std::uintptr_t>(address), *info)) {
++        return 0;
++    }
++    return sizeof(MEMORY_BASIC_INFORMATION);
++}
++
++inline BOOL VirtualProtect(LPVOID address, SIZE_T size, DWORD protect, DWORD* old_protect) {
++    const std::uintptr_t page = static_cast<std::uintptr_t>(sysconf(_SC_PAGESIZE));
++    const std::uintptr_t start = reinterpret_cast<std::uintptr_t>(address) & ~(page - 1);
++    const std::uintptr_t end =
++        (reinterpret_cast<std::uintptr_t>(address) + (size ? size : 1) + page - 1) & ~(page - 1);
++    if (old_protect != nullptr) {
++        MEMORY_BASIC_INFORMATION info{};
++        *old_protect = RytyCompat::QueryMapping(start, info) && info.State == MEM_COMMIT
++                           ? info.Protect
++                           : PAGE_NOACCESS;
++    }
++    if (mprotect(reinterpret_cast<void*>(start), end - start, RytyCompat::ProtFromPage(protect)) !=
++        0) {
++        return FALSE;
++    }
++    RytyCompat::MappingsChanged();
++    return TRUE;
++}
++
++inline LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD type, DWORD protect) {
++    const int prot = (type & MEM_COMMIT) != 0 ? RytyCompat::ProtFromPage(protect) : PROT_NONE;
++    void* result = mmap(address, size, prot,
++                        MAP_PRIVATE | MAP_ANONYMOUS | (address ? MAP_FIXED_NOREPLACE : 0), -1, 0);
++    if (result == MAP_FAILED) {
++        return nullptr;
++    }
++    RytyCompat::MappingsChanged();
++    return result;
++}
++
++inline BOOL VirtualFree(LPVOID address, SIZE_T size, DWORD /*type*/) {
++    // MEM_RELEASE with size 0 frees the whole allocation: the mapping holding the address.
++    if (size == 0) {
++        MEMORY_BASIC_INFORMATION info{};
++        if (!RytyCompat::QueryMapping(reinterpret_cast<std::uintptr_t>(address), info)) {
++            return FALSE;
++        }
++        size = info.RegionSize;
++    }
++    const BOOL ok = munmap(address, size) == 0;
++    RytyCompat::MappingsChanged();
++    return ok;
++}
++
++inline BOOL FlushInstructionCache(HANDLE, LPCVOID address, SIZE_T size) {
++    auto* start = static_cast<char*>(const_cast<void*>(address));
++    __builtin___clear_cache(start, start + size);
++    return TRUE;
++}
++
++inline HANDLE GetCurrentProcess() {
++    return reinterpret_cast<HANDLE>(-1);
++}
++
++inline DWORD GetCurrentThreadId() {
++    return static_cast<DWORD>(syscall(SYS_gettid));
++}
++
++inline DWORD GetLastError() {
++    return static_cast<DWORD>(errno);
++}
++
++inline std::uint64_t GetTickCount64() {
++    timespec now{};
++    clock_gettime(CLOCK_MONOTONIC, &now);
++    return static_cast<std::uint64_t>(now.tv_sec) * 1000 + static_cast<std::uint64_t>(now.tv_nsec) / 1000000;
++}
++
++/// A module of the process by file name ("libc.prx"). For nullptr, as on Windows, the main
++/// executable's base address: code computes game addresses as base + 0x10000 + eboot address
++/// (the Windows layout), so on Linux it is the load address minus that shift. Not a handle for
++/// GetProcAddress.
++inline HMODULE GetModuleHandleA(const char* name) {
++    if (name == nullptr) {
++        return reinterpret_cast<HMODULE>(RytyCompat::MainImageBias() - RytyCompat::WindowsTextShift);
++    }
++    return dlopen(name, RTLD_LAZY | RTLD_NOLOAD);
++}
++
++inline FARPROC GetProcAddress(HMODULE module, const char* name) {
++    return module ? dlsym(module, name) : nullptr;
++}
++
++inline BOOL FreeLibrary(HMODULE module) {
++    return module && dlclose(module) == 0;
++}
++
++inline BOOL CloseHandle(HANDLE) {
++    return TRUE;
++}
++
++inline std::uint16_t _byteswap_ushort(std::uint16_t value) {
++    return __builtin_bswap16(value);
++}
++inline std::uint32_t _byteswap_ulong(std::uint32_t value) {
++    return __builtin_bswap32(value);
++}
++inline std::uint64_t _byteswap_uint64(std::uint64_t value) {
++    return __builtin_bswap64(value);
++}
++
++inline DWORD GetTickCount() {
++    return static_cast<DWORD>(GetTickCount64());
++}
++
++inline void Sleep(DWORD milliseconds) {
++    usleep(static_cast<useconds_t>(milliseconds) * 1000);
++}
++
++/// The file a module was loaded from (the main executable for nullptr), as Windows fills it:
++/// truncated to size - 1 characters, returns the length.
++inline DWORD GetModuleFileNameA(HMODULE module, char* buffer, DWORD size) {
++    if (size == 0) {
++        return 0;
++    }
++    std::string path;
++    if (module == nullptr) {
++        char exe[MAX_PATH];
++        const ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
++        path.assign(exe, n > 0 ? static_cast<std::size_t>(n) : 0);
++    } else {
++        Dl_info info{};
++        // A handle from dlopen is not an address: ask for the file of a symbol in the module.
++        void* symbol = dlsym(module, "RytyLibraryInitialize");
++        if (symbol != nullptr && dladdr(symbol, &info) && info.dli_fname != nullptr) {
++            path = info.dli_fname;
++        }
++    }
++    const std::size_t length = std::min<std::size_t>(path.size(), size - 1);
++    std::memcpy(buffer, path.data(), length);
++    buffer[length] = '\0';
++    return static_cast<DWORD>(length);
++}
++
++inline DWORD GetModuleFileNameW(HMODULE module, wchar_t* buffer, DWORD size) {
++    std::vector<char> narrow(size ? size : 1);
++    const DWORD length = GetModuleFileNameA(module, narrow.data(), size);
++    for (DWORD i = 0; i <= length && i < size; ++i) {
++        buffer[i] = static_cast<unsigned char>(narrow[i]); // file names here are ASCII
++    }
++    return length;
++}
++
++inline HMODULE GetModuleHandleW(const wchar_t* name) {
++    if (name == nullptr) {
++        return GetModuleHandleA(nullptr);
++    }
++    std::string narrow;
++    for (const wchar_t* c = name; *c; ++c) {
++        narrow += static_cast<char>(*c);
++    }
++    return GetModuleHandleA(narrow.c_str());
++}
++
++/// Slim reader/writer locks, as pthread read-write locks.
++struct SRWLOCK {
++    pthread_rwlock_t lock = PTHREAD_RWLOCK_INITIALIZER;
++};
++#define SRWLOCK_INIT {}
++inline void InitializeSRWLock(SRWLOCK* lock) {
++    pthread_rwlock_init(&lock->lock, nullptr);
++}
++inline void AcquireSRWLockShared(SRWLOCK* lock) {
++    pthread_rwlock_rdlock(&lock->lock);
++}
++inline void ReleaseSRWLockShared(SRWLOCK* lock) {
++    pthread_rwlock_unlock(&lock->lock);
++}
++inline void AcquireSRWLockExclusive(SRWLOCK* lock) {
++    pthread_rwlock_wrlock(&lock->lock);
++}
++inline void ReleaseSRWLockExclusive(SRWLOCK* lock) {
++    pthread_rwlock_unlock(&lock->lock);
++}
++
++#endif // _WIN32
+diff --git a/ryty_gpu/ryty_write_watch.cpp b/ryty_gpu/ryty_write_watch.cpp
+index a2bc1862..9126ed3b 100644
+--- a/ryty_gpu/ryty_write_watch.cpp
++++ b/ryty_gpu/ryty_write_watch.cpp
+@@ -3,8 +3,10 @@
+ // constants of a draw after it was decoded and lists every write to them (time, thread, code
+ // address in GTSport.exe, value) for a few milliseconds.
+ 
+-#include <windows.h>
++#include "ryty_gpu/ryty_win32_compat.h"
++#ifdef _WIN32
+ #include <tlhelp32.h>
++#endif
+ 
+ #include <algorithm>
+ #include <array>
+@@ -17,6 +19,7 @@
+ #include <fmt/format.h>
+ #include "common/logging/log.h"
+ 
++#ifdef _WIN32
+ namespace {
+ 
+ struct Hit {
+@@ -229,3 +232,12 @@ void RytyWatchWrites(std::uint64_t address, std::uint32_t ms, std::string label)
+     }).detach();
+ }
+ } // namespace Vulkan
++#else
++namespace Vulkan {
++// DIAG-067 sets hardware data breakpoints through Windows thread contexts; not on Linux.
++void RytyWatchWrites(std::uint64_t address, std::uint32_t, std::string label) {
++    LOG_WARNING(Render, "DIAG-067: write watches are Windows-only; not watching {:#x} ({})",
++                address, label);
++}
++} // namespace Vulkan
++#endif
+-- 
+2.56.0
+

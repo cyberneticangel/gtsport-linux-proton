@@ -1,0 +1,89 @@
+From 6b0405da0023299ddf7b8a57a52d8d5de4fa13cf Mon Sep 17 00:00:00 2001
+From: cyberneticangel <cyberneticangel@proton.me>
+Date: Tue, 20 Oct 2026 16:49:59 +0200
+Subject: [PATCH 12/12] Renderer diagnostics: DIAG-142 logs guarded reads that
+ fault unresolved, DIAG-143 (SHADGT_FORCE_UPLOAD=1) uploads buffers and images
+ on every use
+
+---
+ ryty_gpu/ryty_core_shims.cpp                   | 16 ++++++++++++++++
+ src/video_core/buffer_cache/buffer_cache.cpp   |  9 +++++++++
+ src/video_core/texture_cache/texture_cache.cpp | 10 ++++++++++
+ 3 files changed, 35 insertions(+)
+
+diff --git a/ryty_gpu/ryty_core_shims.cpp b/ryty_gpu/ryty_core_shims.cpp
+index 03886ec9..f8bf754e 100644
+--- a/ryty_gpu/ryty_core_shims.cpp
++++ b/ryty_gpu/ryty_core_shims.cpp
+@@ -791,11 +791,27 @@ static void UnblockFaultSignals() {
+     pthread_sigmask(SIG_UNBLOCK, &faults, nullptr);
+ }
+ 
++// DIAG-142: guarded reads that hit a fault nothing resolved (the caller then reads zeros).
++static void NoteGuardedEscape(const void* source, size_t size) {
++    static std::atomic<u64> escapes{};
++    const u64 n = ++escapes;
++    if (n <= 40 || (n & (n - 1)) == 0) {
++        MEMORY_BASIC_INFORMATION info{};
++        const bool known = VirtualQuery(source, &info, sizeof(info)) == sizeof(info);
++        LOG_WARNING(Render_Vulkan,
++                    "DIAG-142: guarded read of {}+{:#x} faulted unresolved ({} so far); mapping {:#x}+{:#x} "
++                    "state {:#x} protect {:#x}",
++                    fmt::ptr(source), size, n, known ? reinterpret_cast<u64>(info.BaseAddress) : 0,
++                    known ? info.RegionSize : 0, known ? info.State : 0, known ? info.Protect : 0);
++    }
++}
++
+ static bool GuardedCopyRaw(void* dest, const void* source, size_t size) {
+     sigjmp_buf guard;
+     if (sigsetjmp(guard, 0) != 0) {
+         t_guard = nullptr;
+         UnblockFaultSignals();
++        NoteGuardedEscape(source, size);
+         return false;
+     }
+     t_guard = &guard;
+diff --git a/src/video_core/buffer_cache/buffer_cache.cpp b/src/video_core/buffer_cache/buffer_cache.cpp
+index b7a9f507..6a3bca20 100644
+--- a/src/video_core/buffer_cache/buffer_cache.cpp
++++ b/src/video_core/buffer_cache/buffer_cache.cpp
+@@ -1717,6 +1717,15 @@ static std::atomic<u64> g_obtain_size_counts[5]{};
+ 
+ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
+                                                         bool is_written, bool is_texel_buffer) {
++    // DIAG-143 (SHADGT_FORCE_UPLOAD=1, measurement only, slow): read-only ranges up to 64 MB are
++    // uploaded from guest memory again on every obtain, whatever page tracking says.
++    static const bool force_upload = [] {
++        const char* env = std::getenv("SHADGT_FORCE_UPLOAD");
++        return env && env[0] == '1';
++    }();
++    if (force_upload && !is_written && size <= 64_MB && size != 0) {
++        memory_tracker->MarkRegionAsCpuModified(device_addr, size);
++    }
+     // EXP-127 (SHADGT_CEIL_NOBUFFERS=1, measurement only, rendering goes wrong): 190 s in, every
+     // buffer obtain returns a 1 GB dummy buffer without any other work: the recorder's cost per
+     // draw if buffer memory needed no CPU work at all (the direct renderer's model).
+diff --git a/src/video_core/texture_cache/texture_cache.cpp b/src/video_core/texture_cache/texture_cache.cpp
+index 41e04260..265f46b9 100644
+--- a/src/video_core/texture_cache/texture_cache.cpp
++++ b/src/video_core/texture_cache/texture_cache.cpp
+@@ -1293,6 +1293,16 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
+ }
+ 
+ void TextureCache::RefreshImage(Image& image) {
++    // DIAG-143 (SHADGT_FORCE_UPLOAD=1, measurement only, slow): images the GPU never wrote are
++    // uploaded from guest memory again on every use, whatever page tracking says.
++    static const bool force_upload = [] {
++        const char* env = std::getenv("SHADGT_FORCE_UPLOAD");
++        return env && env[0] == '1';
++    }();
++    if (force_upload && False(image.flags & ImageFlagBits::GpuModified) &&
++        False(image.flags & ImageFlagBits::GpuDirty)) {
++        image.flags |= ImageFlagBits::CpuDirty;
++    }
+     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
+         return;
+     }
+-- 
+2.56.0
+

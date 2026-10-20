@@ -1,0 +1,267 @@
+From 3634bf10dcdcdbc26a73bc227e57080595eda7e9 Mon Sep 17 00:00:00 2001
+From: cyberneticangel <dylan.fantauzzo7@proton.me>
+Date: Mon, 19 Oct 2026 19:11:49 +0200
+Subject: [PATCH 02/12] Linux: the renderer core builds for the Ryty host
+ libraries
+
+- CMake: allow non-Windows builds with SHADGT_RYTY_GPU=ON.
+- <intrin.h> only with MSVC; <x86intrin.h> elsewhere.
+- vk_platform.cpp: undefine Xlib's None/Always/Bool/Status/Success, which
+  collide with renderer enumerators.
+- page_manager.cpp, buffer_cache.cpp: ryty_diag.h (and spin_lock.h,
+  guest_hash.h) on every platform; the Linux branches used RYDIAG_SCOPE too.
+- image.cpp, buffer_cache.cpp: explicit u64/VAddr types where strtoull and
+  size literals are unsigned long long.
+- proto_import.cpp: the Windows memory-kind probes are Windows-only.
+---
+ CMakeLists.txt                                 | 4 ++--
+ ryty_gpu/ryty_core_shims.cpp                   | 4 ++++
+ ryty_gpu/ryty_diag.h                           | 4 ++++
+ src/common/perf_monitor.cpp                    | 4 ++++
+ src/common/perf_monitor.h                      | 4 ++++
+ src/common/rdtsc.h                             | 4 ++++
+ src/common/spin_lock.cpp                       | 4 ++++
+ src/common/uint128.h                           | 4 ++++
+ src/video_core/buffer_cache/buffer_cache.cpp   | 8 ++++++--
+ src/video_core/buffer_cache/proto_import.cpp   | 2 ++
+ src/video_core/page_manager.cpp                | 3 +--
+ src/video_core/renderer_vulkan/vk_platform.cpp | 9 +++++++++
+ src/video_core/texture_cache/image.cpp         | 2 +-
+ 13 files changed, 49 insertions(+), 7 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index ff6430a4..d8192e1e 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -13,8 +13,8 @@ endif()
+ 
+ project(shadPS4 CXX C ASM)
+ 
+-if(NOT WIN32)
+-    message(FATAL_ERROR "shadGT supports Windows builds only.")
++if(NOT WIN32 AND NOT SHADGT_RYTY_GPU)
++    message(FATAL_ERROR "shadGT supports Windows builds only (on Linux, only the Ryty host libraries: -DSHADGT_RYTY_GPU=ON).")
+ endif()
+ 
+ include(FetchContent)
+diff --git a/ryty_gpu/ryty_core_shims.cpp b/ryty_gpu/ryty_core_shims.cpp
+index 495e9919..f6ce68b6 100644
+--- a/ryty_gpu/ryty_core_shims.cpp
++++ b/ryty_gpu/ryty_core_shims.cpp
+@@ -4,7 +4,11 @@
+ 
+ #include "ryty_gpu/ryty_diag.h"
+ #include <windows.h>
++#ifdef _MSC_VER
+ #include <intrin.h>
++#else
++#include <x86intrin.h>
++#endif
+ #include <algorithm>
+ #include <array>
+ #include <atomic>
+diff --git a/ryty_gpu/ryty_diag.h b/ryty_gpu/ryty_diag.h
+index ed7754e8..9e2c83fb 100644
+--- a/ryty_gpu/ryty_diag.h
++++ b/ryty_gpu/ryty_diag.h
+@@ -10,7 +10,11 @@
+ #pragma once
+ 
+ #include <chrono>
++#ifdef _MSC_VER
+ #include <intrin.h>
++#else
++#include <x86intrin.h>
++#endif
+ #include "common/types.h"
+ 
+ namespace RyDiag {
+diff --git a/src/common/perf_monitor.cpp b/src/common/perf_monitor.cpp
+index 5f3c305d..6b1266d9 100644
+--- a/src/common/perf_monitor.cpp
++++ b/src/common/perf_monitor.cpp
+@@ -15,7 +15,11 @@
+ #include "common/types.h"
+ 
+ #ifdef _WIN32
++#ifdef _MSC_VER
+ #include <intrin.h>
++#else
++#include <x86intrin.h>
++#endif
+ #include <windows.h>
+ // tlhelp32.h needs the Windows types declared first.
+ #include <tlhelp32.h>
+diff --git a/src/common/perf_monitor.h b/src/common/perf_monitor.h
+index 4898a4c2..15717b3d 100644
+--- a/src/common/perf_monitor.h
++++ b/src/common/perf_monitor.h
+@@ -7,7 +7,11 @@
+ #include <atomic>
+ #include <string>
+ #if defined(_WIN32) || defined(__x86_64__)
++#ifdef _MSC_VER
+ #include <intrin.h>
++#else
++#include <x86intrin.h>
++#endif
+ #endif
+ #include "common/types.h"
+ 
+diff --git a/src/common/rdtsc.h b/src/common/rdtsc.h
+index 4e4d5843..abe4b06d 100644
+--- a/src/common/rdtsc.h
++++ b/src/common/rdtsc.h
+@@ -5,8 +5,12 @@
+ 
+ #include "common/arch.h"
+ 
++#ifdef _MSC_VER
+ #ifdef _MSC_VER
+ #include <intrin.h>
++#else
++#include <x86intrin.h>
++#endif
+ #endif
+ 
+ #include "common/types.h"
+diff --git a/src/common/spin_lock.cpp b/src/common/spin_lock.cpp
+index b2ef4ea1..fa93d78c 100755
+--- a/src/common/spin_lock.cpp
++++ b/src/common/spin_lock.cpp
+@@ -4,7 +4,11 @@
+ #include "common/spin_lock.h"
+ 
+ #if _MSC_VER
++#ifdef _MSC_VER
+ #include <intrin.h>
++#else
++#include <x86intrin.h>
++#endif
+ #if _M_AMD64
+ #define __x86_64__ 1
+ #endif
+diff --git a/src/common/uint128.h b/src/common/uint128.h
+index 77c4a271..a5d6cc44 100644
+--- a/src/common/uint128.h
++++ b/src/common/uint128.h
+@@ -8,7 +8,11 @@
+ #ifdef _MSC_VER
+ #ifndef __clang__
+ #define HAS_INTRINSICS
++#ifdef _MSC_VER
+ #include <intrin.h>
++#else
++#include <x86intrin.h>
++#endif
+ #pragma intrinsic(__umulh)
+ #pragma intrinsic(_umul128)
+ #pragma intrinsic(_udiv128)
+diff --git a/src/video_core/buffer_cache/buffer_cache.cpp b/src/video_core/buffer_cache/buffer_cache.cpp
+index 9132cdeb..40e749f8 100644
+--- a/src/video_core/buffer_cache/buffer_cache.cpp
++++ b/src/video_core/buffer_cache/buffer_cache.cpp
+@@ -2,7 +2,11 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#ifdef _MSC_VER
+ #include <intrin.h>
++#else
++#include <x86intrin.h>
++#endif
+ #include <array>
+ #include <atomic>
+ #include <condition_variable>
+@@ -45,9 +49,9 @@
+ #include <vk_mem_alloc.h>
+ #ifdef _WIN32
+ #include <windows.h>
++#endif
+ #include "core/guest_hash.h"
+ #include "ryty_gpu/ryty_diag.h"
+-#endif
+ 
+ namespace VideoCore {
+ 
+@@ -1219,7 +1223,7 @@ void BufferCache::SyncUnseenCpuWrites(const Buffer* arena, VAddr address, u64 si
+         }
+         auto& snapshot = *it->second;
+         Common::CopyGuest(now.data(), std::bit_cast<const void*>(page), 4_KB);
+-        const u32 last = static_cast<u32>(std::min(end, page + 4_KB) - page);
++        const u32 last = static_cast<u32>(std::min<VAddr>(end, page + 4_KB) - page);
+         u32 i = static_cast<u32>(std::max(address, page) - page);
+         while (i < last) {
+             while (i < last && now[i] == snapshot[i]) {
+diff --git a/src/video_core/buffer_cache/proto_import.cpp b/src/video_core/buffer_cache/proto_import.cpp
+index 9fa986fd..19bddcaf 100644
+--- a/src/video_core/buffer_cache/proto_import.cpp
++++ b/src/video_core/buffer_cache/proto_import.cpp
+@@ -233,6 +233,7 @@ void ProtoImportTest(const Vulkan::Instance& instance, Vulkan::Scheduler& schedu
+     try_writable(address, 16_KB, "16 KB");
+     try_writable(view_base, std::min<u64>(cursor - view_base, 256_MB), "whole view");
+ #endif
++#ifdef _WIN32 // Windows memory kinds (VirtualProtect, sections)
+     // Pinned test: the view imported while writable, its protections put back, then the GPU's
+     // copy of it compared with the CPU's bytes; the import stays alive for the rest of the run.
+     {
+@@ -316,6 +317,7 @@ void ProtoImportTest(const Vulkan::Instance& instance, Vulkan::Scheduler& schedu
+             CloseHandle(section);
+         }
+     }
++#endif
+     LOG_WARNING(Render_Vulkan, "P1: maxMemoryAllocationCount {}",
+                 props2.properties.limits.maxMemoryAllocationCount);
+ }
+diff --git a/src/video_core/page_manager.cpp b/src/video_core/page_manager.cpp
+index 632d15d4..3e0dfb97 100644
+--- a/src/video_core/page_manager.cpp
++++ b/src/video_core/page_manager.cpp
+@@ -37,10 +37,9 @@
+ #include <poll.h>
+ #include <sys/ioctl.h>
+ #include <sys/syscall.h>
+-#else
++#endif
+ #include "common/spin_lock.h"
+ #include "ryty_gpu/ryty_diag.h"
+-#endif
+ 
+ namespace VideoCore {
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_platform.cpp b/src/video_core/renderer_vulkan/vk_platform.cpp
+index 75642713..d0fcf53f 100644
+--- a/src/video_core/renderer_vulkan/vk_platform.cpp
++++ b/src/video_core/renderer_vulkan/vk_platform.cpp
+@@ -22,6 +22,15 @@
+ #include "core/emulator_settings.h"
+ #include "sdl_window.h"
+ #include "video_core/renderer_vulkan/vk_platform.h"
++#ifdef VK_USE_PLATFORM_XLIB_KHR
++// Xlib's macros collide with the renderer's enumerators (NumberConversion::None,
++// CompareFunc::Always, ...) in the headers below.
++#undef None
++#undef Always
++#undef Bool
++#undef Status
++#undef Success
++#endif
+ #ifdef RYTY_GPU
+ #include "ryty_gpu/ryty_dlss.h"
+ #include "ryty_gpu/ryty_dlssg.h"
+diff --git a/src/video_core/texture_cache/image.cpp b/src/video_core/texture_cache/image.cpp
+index d25255b5..6fbfff0d 100644
+--- a/src/video_core/texture_cache/image.cpp
++++ b/src/video_core/texture_cache/image.cpp
+@@ -222,7 +222,7 @@ std::unordered_map<RecycleKey, std::vector<RecycledImage>, RecycleKeyHash> g_rec
+ u64 g_recycled_bytes = 0;
+ // GPU.image_recycle_mb (launcher quality preset) or SHADGT_IMAGE_RECYCLE_MB; 512 by default.
+ u64 RecycleBudgetBytes() {
+-    static const u64 budget = [] {
++    static const u64 budget = []() -> u64 {
+         if (const char* env = std::getenv("SHADGT_IMAGE_RECYCLE_MB"); env && *env) {
+             return std::strtoull(env, nullptr, 10) << 20;
+         }
+-- 
+2.56.0
+

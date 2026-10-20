@@ -1,0 +1,103 @@
+From 72af580bab50525350b943d1558b62741f46f713 Mon Sep 17 00:00:00 2001
+From: cyberneticangel <dylan.fantauzzo7@proton.me>
+Date: Mon, 19 Oct 2026 19:44:03 +0200
+Subject: [PATCH 04/12] Linux: DLL-like symbol scope for the Ryty libraries;
+ they load in the game
+
+- Hidden visibility by default, --exclude-libs,ALL and -Bsymbolic: each of
+  the eight libraries defines ryty_export_dispatch, RytyLibraryEnsureInit
+  and its export tables; with ELF interposition the first one loaded served
+  the others, and the thunks' r11 argument went through the PLT.
+- ryty_export_dispatch is .hidden; -z defs reports undefined symbols at
+  link time, as the Windows linker does.
+- Linux stubs for shadGT's guest-signal helpers (Ryty owns guest signals)
+  and a weak PrecompileHoldsGame for the libraries without the renderer.
+---
+ ryty_gpu/RytyGpu.cmake    | 12 ++++++++++++
+ ryty_gpu/ryty_library.cpp |  3 +++
+ ryty_gpu/ryty_stubs.cpp   | 25 +++++++++++++++++++++++++
+ 3 files changed, 40 insertions(+)
+
+diff --git a/ryty_gpu/RytyGpu.cmake b/ryty_gpu/RytyGpu.cmake
+index 28b5584a..b089b5b6 100644
+--- a/ryty_gpu/RytyGpu.cmake
++++ b/ryty_gpu/RytyGpu.cmake
+@@ -60,6 +60,18 @@ function(ryty_add_library target output)
+     target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}
+         ${HOST_SHADERS_INCLUDE} ${IMGUI_RESOURCES_INCLUDE})
+     add_dependencies(${target} host_shaders ImGui_Resources)
++    if (NOT WIN32)
++        # Windows DLL semantics on Linux: each library keeps its symbols to itself (every one
++        # defines ryty_export_dispatch, RytyLibraryEnsureInit and its export tables, and the
++        # bundled static libraries' singletons), exporting only its dllexport functions and NID
++        # labels, and binds its own references locally. Otherwise the first library loaded
++        # interposes the others' and the export thunks' r11 argument goes through the PLT.
++        set_target_properties(${target} PROPERTIES CXX_VISIBILITY_PRESET hidden
++                                                    C_VISIBILITY_PRESET hidden
++                                                    VISIBILITY_INLINES_HIDDEN ON)
++        # -z defs: report undefined symbols at link time, as the Windows linker does.
++        target_link_options(${target} PRIVATE -Wl,--exclude-libs,ALL -Wl,-Bsymbolic -Wl,-z,defs)
++    endif()
+     if (WIN32)
+         target_link_libraries(${target} PRIVATE mincore wbemuuid)
+         target_link_options(${target} PRIVATE /errorlimit:0)
+diff --git a/ryty_gpu/ryty_library.cpp b/ryty_gpu/ryty_library.cpp
+index 86a2dc44..7de6a3cf 100644
+--- a/ryty_gpu/ryty_library.cpp
++++ b/ryty_gpu/ryty_library.cpp
+@@ -113,6 +113,9 @@ extern "C" void RytyLibraryEnsureInit() {
+ __asm__(".att_syntax prefix\n"
+         ".text\n"
+         ".globl ryty_export_dispatch\n"
++#ifndef _WIN32
++        ".hidden ryty_export_dispatch\n"
++#endif
+         "ryty_export_dispatch:\n"
+         "    cmpb $0, g_ryty_library_ready(%rip)\n"
+         "    jne 1f\n"
+diff --git a/ryty_gpu/ryty_stubs.cpp b/ryty_gpu/ryty_stubs.cpp
+index 9b66d267..063f72db 100644
+--- a/ryty_gpu/ryty_stubs.cpp
++++ b/ryty_gpu/ryty_stubs.cpp
+@@ -161,6 +161,21 @@ bool Pthread::DispatchSignal(s32, Siginfo*, Ucontext*) {
+     return false;
+ }
+ 
++#ifndef _WIN32
++// Linux: shadGT's signal handler (core/signals.cpp) converts the host signal for the guest before
++// asking the guest thread to take it. Ryty owns guest signals, so DispatchSignal declines and
++// these only need to exist (shadGT's kernel.cpp, which defines them, is Ryty's).
++s32 NativeToOrbisSignal(s32 s) {
++    return s;
++}
++s32 NativeToPosixErrno(s32 e) {
++    return e;
++}
++bool Pthread::DispatchPendingSignals(Siginfo*, Ucontext*) {
++    return false;
++}
++#endif
++
+ u64 PS4_SYSV_ABI sceKernelGetEventData(const OrbisKernelEvent* ev) {
+     return ev->data;
+ }
+@@ -193,6 +208,16 @@ s32 PS4_SYSV_ABI sceKernelGetSystemSwVersion(SwVersionStruct* ret) {
+ 
+ } // namespace Libraries::Kernel
+ 
++#ifndef _WIN32
++// Linux: only the renderer defines it (vk_pipeline_cache.cpp); the other libraries link
++// IsSplashVisible below too, which the Windows linker drops as unused.
++namespace Vulkan {
++__attribute__((weak)) bool PrecompileHoldsGame() {
++    return false;
++}
++} // namespace Vulkan
++#endif
++
+ namespace Libraries::SystemService {
+ // The game's splash screen (sce_sys/pic1.png), with the Show Splash setting. GT Sport asks to hide
+ // it right at start (sceSystemServiceHideSplashScreen, which Ryty's libSceSystemService forwards
+-- 
+2.56.0
+

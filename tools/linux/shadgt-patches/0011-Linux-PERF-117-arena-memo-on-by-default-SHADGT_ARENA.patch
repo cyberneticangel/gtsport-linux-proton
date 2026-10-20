@@ -1,0 +1,39 @@
+From 32973cd396d4955e953d39dd336812dabb72a7d5 Mon Sep 17 00:00:00 2001
+From: cyberneticangel <cyberneticangel@proton.me>
+Date: Tue, 20 Oct 2026 09:26:17 +0200
+Subject: [PATCH 11/12] Linux: PERF-117 arena memo on by default
+ (SHADGT_ARENA_MEMO=0 turns it off)
+
+---
+ src/video_core/buffer_cache/buffer_cache.cpp | 13 ++++++++++---
+ 1 file changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/src/video_core/buffer_cache/buffer_cache.cpp b/src/video_core/buffer_cache/buffer_cache.cpp
+index d1eda374..b7a9f507 100644
+--- a/src/video_core/buffer_cache/buffer_cache.cpp
++++ b/src/video_core/buffer_cache/buffer_cache.cpp
+@@ -2118,11 +2118,18 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferImpl(VAddr device_addr, u
+     // later draws of the epoch bind it without walking, hashing or protecting its pages again.
+     // Draws bind the same pool ranges over and over (~1 arena read per draw, ~2.7 us each).
+     // Only ranges above the stream threshold, which always come from the arena.
+-    // Opt-in (SHADGT_ARENA_MEMO=1): no measurable gain in the Tokyo A/B, kept for the ceiling
+-    // tests and the draw-state cache.
++    // No measurable gain in the Tokyo A/B on Windows, where huge read-only ranges are read in
++    // place; on Linux (no imports) it took buffer obtains from 1.5 s to 0.7 s per 2 s in GT
++    // Sport's pre-race menu (15 -> 30 fps). On there by default, opt-in elsewhere
++    // (SHADGT_ARENA_MEMO=1 on, 0 off).
+     static const bool arena_memo_enabled = [] {
+         const char* env = std::getenv("SHADGT_ARENA_MEMO");
+-        return Common::PerfFeatureEnabled(117) && env && env[0] == '1';
++#ifdef _WIN32
++        const bool default_on = false;
++#else
++        const bool default_on = true;
++#endif
++        return Common::PerfFeatureEnabled(117) && (env && *env ? env[0] == '1' : default_on);
+     }();
+     ArenaMemo* memo_lookup_slot = nullptr;
+     u64 memo_versions = 0;
+-- 
+2.56.0
+

@@ -1,0 +1,120 @@
+From f273bc5b4656d81ff9a5815ead525054e6bc2c59 Mon Sep 17 00:00:00 2001
+From: cyberneticangel <dylan.fantauzzo7@proton.me>
+Date: Mon, 19 Oct 2026 20:10:28 +0200
+Subject: [PATCH 05/12] Linux: copies around page tracking through libkernel's
+ memfd backing
+
+CopyThroughAlias uses Ryty's RytyDirectMemoryCopy (direct memory) and
+/proc/self/mem (other memory) instead of the Windows alias views.
+TryWriteBacking logs why a write failed (first 20 times).
+---
+ ryty_gpu/ryty_core_shims.cpp   | 29 ++++++++++++++++++++++++++++-
+ ryty_gpu/ryty_win32_compat.cpp | 13 ++++++++++++-
+ ryty_gpu/ryty_win32_compat.h   |  2 ++
+ 3 files changed, 42 insertions(+), 2 deletions(-)
+
+diff --git a/ryty_gpu/ryty_core_shims.cpp b/ryty_gpu/ryty_core_shims.cpp
+index c89713cd..be5fe530 100644
+--- a/ryty_gpu/ryty_core_shims.cpp
++++ b/ryty_gpu/ryty_core_shims.cpp
+@@ -140,6 +140,9 @@ void DropAliases(VAddr address, u64 size) {
+ // recorder in a 20-car race). Pages without an alias (not Ryty shared memory) are remembered as
+ // such (a null view) and return false, so the caller takes the usual path.
+ bool WriteThroughCachedAlias(VAddr address, const void* source, u64 size) {
++#ifndef _WIN32
++    return false; // no aliases on Linux; CopyThroughAlias writes through /proc/self/mem
++#endif
+     static const auto map_alias = RytyFunction<MapAliasFn>("libc.prx", "TXQU8CpoEtI");
+     static const auto unmap_alias = RytyFunction<UnmapAliasFn>("libc.prx", "674-w6lwWXI");
+     static const bool cache_views = [] {
+@@ -176,6 +179,20 @@ bool WriteThroughCachedAlias(VAddr address, const void* source, u64 size) {
+ }
+ 
+ bool CopyThroughAlias(VAddr address, void* dest, const void* source, u64 size) {
++#ifndef _WIN32
++    // Linux, instead of the Windows alias views: guest direct memory is copied through its
++    // backing file by Ryty's libkernel (writes to read-only shared mappings cannot be forced);
++    // other memory through /proc/self/mem, which reaches pages whatever their protection.
++    using DirectCopyFn = bool (*)(u64, void*, const void*, u64);
++    static const auto direct_copy =
++        RytyFunction<DirectCopyFn>("libkernel.prx", "RytyDirectMemoryCopy_nid_no_patch");
++    if (direct_copy != nullptr && direct_copy(address, dest, source, size)) {
++        return true;
++    }
++    return dest != nullptr
++               ? RytyCompat::ReadIgnoringProtection(dest, reinterpret_cast<const void*>(address), size)
++               : RytyCompat::WriteIgnoringProtection(reinterpret_cast<void*>(address), source, size);
++#endif
+     static const auto map_alias = RytyFunction<MapAliasFn>("libc.prx", "TXQU8CpoEtI");
+     static const auto unmap_alias = RytyFunction<UnmapAliasFn>("libc.prx", "674-w6lwWXI");
+     if (map_alias == nullptr || unmap_alias == nullptr) {
+@@ -1009,8 +1026,16 @@ std::string MemoryManager::DescribeBackingWrites(VAddr address, u64 margin) {
+ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size,
+                                     std::source_location loc) {
+     const auto virtual_addr = reinterpret_cast<VAddr>(address);
+-    if (!RytyMemory::IsValidMapping(virtual_addr, size)) {
++    const auto failed = [&](const char* why) {
++        static std::atomic<u32> logged{};
++        if (logged++ < 20) {
++            LOG_WARNING(Render_Vulkan, "TryWriteBacking {:#x}+{:#x} failed: {} ({}:{})", virtual_addr,
++                        size, why, loc.file_name(), loc.line());
++        }
+         return false;
++    };
++    if (!RytyMemory::IsValidMapping(virtual_addr, size)) {
++        return failed("not a valid mapping");
+     }
+     RecordBackingWrite(virtual_addr, size, loc); // DIAG-071
+     static const bool cached_alias_first = Common::PerfFeatureEnabled(112);
+@@ -1028,6 +1053,8 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size,
+     const bool written = CopyThroughAlias(virtual_addr, nullptr, data, size);
+     if (written) {
+         RytyMemory::NoteOwnWrite(virtual_addr, size); // FIX-073
++    } else {
++        failed("the copy around the protection failed");
+     }
+     return written;
+ }
+diff --git a/ryty_gpu/ryty_win32_compat.cpp b/ryty_gpu/ryty_win32_compat.cpp
+index 49de2268..4f484d39 100644
+--- a/ryty_gpu/ryty_win32_compat.cpp
++++ b/ryty_gpu/ryty_win32_compat.cpp
+@@ -206,10 +206,21 @@ bool SafeCopy(void* dest, const void* source, std::size_t size) {
+     return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == static_cast<ssize_t>(size);
+ }
+ 
++static int SelfMemory() {
++    static const int memory = open("/proc/self/mem", O_RDWR | O_CLOEXEC);
++    return memory;
++}
++
++bool ReadIgnoringProtection(void* dest, const void* source, std::size_t size) {
++    return SelfMemory() >= 0 &&
++           pread(SelfMemory(), dest, size, static_cast<off_t>(reinterpret_cast<std::uintptr_t>(source))) ==
++               static_cast<ssize_t>(size);
++}
++
+ bool WriteIgnoringProtection(void* dest, const void* source, std::size_t size) {
+     // Writes through /proc/self/mem go to the pages whatever their protection (the kernel forces
+     // them), so write tracking's protections stay as they are and no fault is raised.
+-    static const int memory = open("/proc/self/mem", O_RDWR | O_CLOEXEC);
++    const int memory = SelfMemory();
+     if (memory < 0) {
+         return false;
+     }
+diff --git a/ryty_gpu/ryty_win32_compat.h b/ryty_gpu/ryty_win32_compat.h
+index 485a7f50..62e6b956 100644
+--- a/ryty_gpu/ryty_win32_compat.h
++++ b/ryty_gpu/ryty_win32_compat.h
+@@ -95,6 +95,8 @@ inline constexpr std::uintptr_t WindowsTextShift = 0x10000;
+ bool SafeCopy(void* dest, const void* source, std::size_t size);
+ /// Writes size bytes into this process's memory regardless of page protections.
+ bool WriteIgnoringProtection(void* dest, const void* source, std::size_t size);
++/// Reads size bytes of this process's memory regardless of page protections.
++bool ReadIgnoringProtection(void* dest, const void* source, std::size_t size);
+ } // namespace RytyCompat
+ 
+ inline SIZE_T VirtualQuery(LPCVOID address, MEMORY_BASIC_INFORMATION* info, SIZE_T size) {
+-- 
+2.56.0
+

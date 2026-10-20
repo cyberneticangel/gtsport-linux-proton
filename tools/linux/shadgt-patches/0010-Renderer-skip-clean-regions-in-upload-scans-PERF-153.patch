@@ -1,0 +1,685 @@
+From 97e31706e6b05e65cca5ae2028991d19b34ba376 Mon Sep 17 00:00:00 2001
+From: cyberneticangel <cyberneticangel@proton.me>
+Date: Tue, 20 Oct 2026 08:45:02 +0200
+Subject: [PATCH 10/12] Renderer: skip clean regions in upload scans
+ (PERF-153), obtain sizes in DIAG-109, opt-in write scan (PERF-154)
+
+PERF-153: a 16 MB region found clean by a whole-region upload scan in the
+current upload epoch is not walked again until a page is marked. Binds of
+huge read-only buffers walked every region they cover (GT Sport's race:
+~25,000 binds over 256 MB a second); race 20 -> ~50 fps with PERF-117.
+
+PERF-154 (Linux, SHADGT_WRITE_SCAN=1, experimental): CPU writes found with
+userfaultfd asynchronous write protection and PAGEMAP_SCAN at each upload
+epoch. Too slow as it is (a scan walks all registered memory, ~4 ms, at
+~230 epochs a second) and the loading screen stalled for 52 s.
+---
+ src/video_core/buffer_cache/buffer_cache.cpp  |  27 ++
+ src/video_core/buffer_cache/buffer_cache.h    |   8 +
+ .../buffer_cache/region_definitions.h         |   6 +
+ src/video_core/buffer_cache/region_manager.h  |  36 +-
+ src/video_core/page_manager.cpp               | 320 +++++++++++++++++-
+ src/video_core/page_manager.h                 |   9 +
+ .../renderer_vulkan/vk_rasterizer.cpp         |   8 +
+ .../renderer_vulkan/vk_rasterizer.h           |   2 +
+ 8 files changed, 410 insertions(+), 6 deletions(-)
+
+diff --git a/src/video_core/buffer_cache/buffer_cache.cpp b/src/video_core/buffer_cache/buffer_cache.cpp
+index 40e749f8..d1eda374 100644
+--- a/src/video_core/buffer_cache/buffer_cache.cpp
++++ b/src/video_core/buffer_cache/buffer_cache.cpp
+@@ -953,6 +953,18 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
+         });
+ }
+ 
++void BufferCache::NoteScannedWrite(VAddr device_addr, u64 size) {
++    // Called with the write scan's lock held, by any thread (also one holding the cache's lock):
++    // takes only the region locks. The page is already written, so GPU bytes guest memory did
++    // not have cannot be read back first; such pages are counted (none in GT Sport's readback
++    // statistics so far).
++    NoteCpuChange(device_addr, size); // FIX-069
++    if (memory_tracker->IsRegionGpuModified(device_addr, size)) {
++        scanned_gpu_writes.fetch_add(1, std::memory_order_relaxed);
++    }
++    memory_tracker->MarkRegionAsCpuModified(device_addr, size);
++}
++
+ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks,
+                              u64 exact_write_size) {
+     RYDIAG_SCOPE(FaultFlush, device_addr);
+@@ -1699,6 +1711,9 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
+ // DIAG-111 (with SHADGT_DIAG_OBTAIN=1): cycles spent in obtains by kind, logged with DIAG-109.
+ static std::atomic<u64> g_obtain_cycles[4]{}; // stream, arena read, arena written, in place (P2)
+ static std::atomic<u64> g_obtain_counts[4]{};
++// DIAG-109: obtain cycles and counts by size: up to 64 KB, 1 MB, 16 MB, 256 MB, larger.
++static std::atomic<u64> g_obtain_size_cycles[5]{};
++static std::atomic<u64> g_obtain_size_counts[5]{};
+ 
+ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
+                                                         bool is_written, bool is_texel_buffer) {
+@@ -1727,6 +1742,9 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
+                          : result.first->mem_type == MemoryType::HostUncached ? 3 // P2 in place
+                          : is_written ? 2 : 1;
+         g_obtain_cycles[kind] += __rdtsc() - start;
++        const int bucket = size <= 64_KB ? 0 : size <= 1_MB ? 1 : size <= 16_MB ? 2 : size <= 256_MB ? 3 : 4;
++        g_obtain_size_cycles[bucket] += __rdtsc() - start;
++        ++g_obtain_size_counts[bucket];
+         // DIAG-115: arena read cycles by 16 MB block (top blocks every 2 s, with DIAG-109).
+         if (kind == 1) {
+             static std::unordered_map<VAddr, std::pair<u64, u64>> by_block;
+@@ -2082,6 +2100,15 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferImpl(VAddr device_addr, u
+                 }
+             }
+             LOG_WARNING(Render_Vulkan, "DIAG-112: upload epoch bumps in 2 s by source:{}", sources);
++            std::string by_size;
++            static constexpr std::array<const char*, 5> SizeNames{"<=64K", "<=1M", "<=16M",
++                                                                  "<=256M", ">256M"};
++            for (size_t i = 0; i < SizeNames.size(); ++i) {
++                by_size += fmt::format(" {} {}/{}", SizeNames[i],
++                                       g_obtain_size_cycles[i].exchange(0) / 1000000,
++                                       g_obtain_size_counts[i].exchange(0));
++            }
++            LOG_WARNING(Render_Vulkan, "DIAG-109: obtain Mcycles/count by size:{}", by_size);
+             calls = repeats = small_calls = small_repeats = epochs = 0;
+             window = now;
+         }
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 6f9dc8f3..55cc62b9 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -103,6 +103,13 @@ public:
+     void TickFrame();
+ 
+     /// Invalidates any buffer in the logical page range.
++    /// PERF-154: the CPU wrote the range (found by the write scan, after the fact).
++    void NoteScannedWrite(VAddr device_addr, u64 size);
++    /// PERF-154: written pages that held GPU data guest memory did not have yet, since the last
++    /// call (their GPU bytes were not read back first, as a write fault would have).
++    u64 TakeScannedGpuWrites() {
++        return scanned_gpu_writes.exchange(0, std::memory_order_relaxed);
++    }
+     void InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks = false,
+                           u64 exact_write_size = 0);
+ 
+@@ -562,6 +569,7 @@ private:
+     void RecordPendingAheadUploads(VAddr device_addr, u64 size);
+     void RecordAheadUpload(AheadUpload& upload);
+     mutable CacheMutex mutex; // R2: exclusive unless a path is known safe shared
++    std::atomic<u64> scanned_gpu_writes{}; // PERF-154
+     Buffer gds_buffer;
+     RangeSet gpu_modified_ranges;
+     /// FIX-079: the bytes a write-through store changed, copied to the arena on the recorder.
+diff --git a/src/video_core/buffer_cache/region_definitions.h b/src/video_core/buffer_cache/region_definitions.h
+index 096b65e6..7241e928 100644
+--- a/src/video_core/buffer_cache/region_definitions.h
++++ b/src/video_core/buffer_cache/region_definitions.h
+@@ -39,7 +39,13 @@ inline std::atomic<u64> g_gfx_submit_count{0};
+ inline std::atomic<void (*)(u32)> g_upload_epoch_listener{nullptr};
+ /// DIAG-112: epoch bumps by source line (index line + 8192 for vk_rasterizer.cpp).
+ inline std::array<std::atomic<u32>, 16384> g_epoch_bump_sources{};
++/// PERF-154: called first by each epoch bump: CPU writes made so far reach the caches before
++/// the work that follows reads guest memory.
++inline std::atomic<void (*)()> g_write_scan_hook{nullptr};
+ inline void BumpUploadEpoch(std::source_location loc = std::source_location::current()) {
++    if (const auto scan = g_write_scan_hook.load(std::memory_order_acquire)) {
++        scan();
++    }
+     {
+         const std::string_view file = loc.file_name();
+         const u32 line = loc.line() & 8191;
+diff --git a/src/video_core/buffer_cache/region_manager.h b/src/video_core/buffer_cache/region_manager.h
+index 1e4687b0..e704d0ce 100644
+--- a/src/video_core/buffer_cache/region_manager.h
++++ b/src/video_core/buffer_cache/region_manager.h
+@@ -9,6 +9,7 @@
+ #include <utility>
+ 
+ #include "common/adaptive_mutex.h"
++#include "common/perf_monitor.h"
+ #include "common/types.h"
+ #include "core/emulator_settings.h"
+ #include "video_core/buffer_cache/region_definitions.h"
+@@ -105,6 +106,7 @@ public:
+         IterateWords(bounds, [&](u64 index, u64 mask) {
+             UpdateStateAndProtection<cpu_op, gpu_op>(write_prot, read_prot, index, mask);
+         });
++        clean = false; // PERF-153
+         if constexpr (cpu_op == StateOp::Set) {
+             cpu_version.fetch_add(1, std::memory_order_release); // PERF-117
+         }
+@@ -136,6 +138,22 @@ public:
+         if constexpr (type == Type::CPU && cpu_op == StateOp::Clear) {
+             RefreshUploadEpoch();
+         }
++        // PERF-153: a region found clean by a whole-region upload scan in this upload epoch has
++        // nothing to upload until a page is marked again (every change below clears the flag).
++        // Binds of huge read-only buffers (GT Sport binds ranges of GBs, ~16,000 a second)
++        // otherwise walk the bits of every region they cover.
++        constexpr bool upload_scan =
++            type == Type::CPU && cpu_op == StateOp::Clear && gpu_op == StateOp::None;
++        if constexpr (upload_scan) {
++            if (clean && clean_epoch == uploaded_epoch) {
++                if constexpr (locked) {
++                    mutex.unlock();
++                }
++                return;
++            }
++        } else {
++            clean = false;
++        }
+         IterateWords(bounds, [&](u64 index, u64 mask) {
+             const u64 base_page = index * PAGES_PER_WORD;
+             u64 word = state[index] & mask;
+@@ -161,6 +179,13 @@ public:
+         if (end_page) {
+             func(cpu_addr + start_page * BYTES_PER_PAGE, (end_page - start_page) * BYTES_PER_PAGE);
+         }
++        if constexpr (upload_scan) {
++            // Cleared now: non-hot pages are clean, hot ones count as uploaded in this epoch.
++            if (clean_regions_enabled && offset == 0 && size == s64(HIGHER_PAGE_SIZE)) {
++                clean = true;
++                clean_epoch = uploaded_epoch;
++            }
++        }
+         const auto write_op = GetPageOp<Type::CPU>(cpu_op);
+         const auto read_op = GetPageOp<Type::GPU>(gpu_op);
+         const bool update_watchers = write_op != PageOp::None || read_op != PageOp::None;
+@@ -201,6 +226,7 @@ public:
+             std::scoped_lock lk{mutex};
+             IterateWords(GetBounds(offset, size),
+                          [&](u64 index, u64 mask) { uploaded[index] &= ~mask; });
++            clean = false; // PERF-153
+         }
+         ChangeRegionState<StateOp::Set, StateOp::None>(offset, size);
+     }
+@@ -245,6 +271,7 @@ public:
+     /// PERF-012: counts CPU write faults on pages that were just made writable (lock held);
+     /// a page that keeps faulting becomes hot and stays unprotected.
+     void NoteCpuWriteFault(u64 offset, u64 size) noexcept {
++        clean = false; // PERF-153
+         const auto [start_word, start_page, end_word, end_page] = GetBounds(offset, size);
+         for (u64 page = start_page; page <= end_page; ++page) {
+             if (hot_pages_enabled && write_faults[page] < HotPageFaults &&
+@@ -267,6 +294,7 @@ public:
+         auto bounds = GetBounds(offset, size);
+         Bounds watcher_bounds;
+         std::scoped_lock lk{mutex};
++        clean = false; // PERF-153
+         bool any = false;
+         IterateWords(bounds, [&](u64 index, u64 mask) {
+             const u64 hot_bits = hot[index] & mask;
+@@ -408,13 +436,19 @@ private:
+ 
+     // PERF-012: hot pages and their uploads in the current epoch.
+     static constexpr u8 HotPageFaults = 8;
+-    inline static const bool hot_pages_enabled = Common::PerfFeatureEnabled(12);
++    // PERF-154: with the write scan a written page costs no fault, so none needs to stay hot.
++    inline static const bool hot_pages_enabled =
++        Common::PerfFeatureEnabled(12) && !WriteScanEnabled();
+     RegionBits hot{};
+     RegionBits uploaded{};
+     u32 uploaded_epoch{};
+     std::array<u8, NUM_REGION_PAGES> write_faults{};
+     // PERF-033: changes each time a page becomes hot.
+     std::array<u16, NUM_REGION_PAGES> hot_generation{};
++    // PERF-153: the whole region had nothing to upload in upload epoch clean_epoch.
++    inline static const bool clean_regions_enabled = Common::PerfFeatureEnabled(153);
++    bool clean{};
++    u32 clean_epoch{};
+ 
+     void RefreshUploadEpoch() {
+         const u32 epoch = g_upload_epoch.load(std::memory_order_acquire);
+diff --git a/src/video_core/page_manager.cpp b/src/video_core/page_manager.cpp
+index 3e0dfb97..024af3bc 100644
+--- a/src/video_core/page_manager.cpp
++++ b/src/video_core/page_manager.cpp
+@@ -33,6 +33,7 @@
+ #ifdef __linux__
+ #include <thread>
+ #include <fcntl.h>
++#include <linux/fs.h>
+ #include <linux/userfaultfd.h>
+ #include <poll.h>
+ #include <sys/ioctl.h>
+@@ -40,19 +41,197 @@
+ #endif
+ #include "common/spin_lock.h"
+ #include "ryty_gpu/ryty_diag.h"
++#if defined(RYTY_GPU) && !defined(_WIN32)
++#include "ryty_gpu/ryty_win32_compat.h"
++#endif
+ 
+ namespace VideoCore {
+ 
++#ifdef __linux__
++namespace {
++
++// PERF-154: guest memory registered with a userfaultfd in asynchronous write-protect mode. A CPU
++// write to a protected page does not fault: the kernel lifts the protection, and PAGEMAP_SCAN
++// later lists the pages without it and protects them again in the same call. Pages of memory
++// that cannot be registered keep mprotect tracking.
++struct WriteScan {
++    int uffd = -1;
++    int pagemap = -1;
++    std::mutex registry_mutex;
++    std::vector<std::pair<VAddr, VAddr>> registered; // sorted, disjoint
++    std::vector<std::pair<VAddr, VAddr>> refused;
++    std::atomic<VAddr> low{~VAddr{0}};
++    std::atomic<VAddr> high{0};
++    std::mutex scan_mutex;
++    std::vector<page_region> regions = std::vector<page_region>(4096);
++    // Statistics, reported every 2 s.
++    u64 scans{};
++    u64 scan_ns{};
++    u64 written_pages{};
++    u64 reported_pages{};
++    u64 registrations{};
++    std::chrono::steady_clock::time_point window = std::chrono::steady_clock::now();
++
++    static WriteScan* Get() {
++        static WriteScan* scan = [] () -> WriteScan* {
++            const char* env = std::getenv("SHADGT_WRITE_SCAN");
++            if (!env || env[0] != '1') {
++                return nullptr;
++            }
++            auto* s = new WriteScan;
++            s->uffd = static_cast<int>(
++                syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY));
++            uffdio_api api{};
++            api.api = UFFD_API;
++            api.features = UFFD_FEATURE_WP_ASYNC | UFFD_FEATURE_WP_HUGETLBFS_SHMEM |
++                           UFFD_FEATURE_WP_UNPOPULATED;
++            s->pagemap = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
++            // (Possibly before logging is set up: the page manager reports the outcome.)
++            if (s->uffd < 0 || ioctl(s->uffd, UFFDIO_API, &api) != 0 || s->pagemap < 0) {
++                Failure() = Common::GetLastErrorMsg();
++                return nullptr;
++            }
++            return s;
++        }();
++        return scan;
++    }
++
++    static std::string& Failure() {
++        static std::string failure;
++        return failure;
++    }
++
++    static bool Contains(const std::vector<std::pair<VAddr, VAddr>>& set, VAddr address) {
++        auto it = std::upper_bound(set.begin(), set.end(), address,
++                                   [](VAddr a, const auto& r) { return a < r.first; });
++        return it != set.begin() && address < std::prev(it)->second;
++    }
++
++    static void Insert(std::vector<std::pair<VAddr, VAddr>>& set, VAddr start, VAddr end) {
++        auto it = std::lower_bound(set.begin(), set.end(), start,
++                                   [](const auto& r, VAddr a) { return r.second < a; });
++        while (it != set.end() && it->first <= end) {
++            start = std::min(start, it->first);
++            end = std::max(end, it->second);
++            it = set.erase(it);
++        }
++        set.insert(it, {start, end});
++    }
++
++    static void Remove(std::vector<std::pair<VAddr, VAddr>>& set, VAddr start, VAddr end) {
++        std::vector<std::pair<VAddr, VAddr>> out;
++        out.reserve(set.size() + 1);
++        for (const auto& [a, b] : set) {
++            if (b <= start || a >= end) {
++                out.emplace_back(a, b);
++                continue;
++            }
++            if (a < start) {
++                out.emplace_back(a, start);
++            }
++            if (b > end) {
++                out.emplace_back(end, b);
++            }
++        }
++        set = std::move(out);
++    }
++
++    /// Registers [start, end) and write-protects it; false if the kernel refuses (memory of a
++    /// kind it cannot track, or a hole).
++    bool Register(VAddr start, VAddr end) {
++        uffdio_register reg{};
++        reg.range.start = start;
++        reg.range.len = end - start;
++        reg.mode = UFFDIO_REGISTER_MODE_WP;
++        if (ioctl(uffd, UFFDIO_REGISTER, &reg) != 0) {
++            return false;
++        }
++        uffdio_writeprotect wp{};
++        wp.range.start = start;
++        wp.range.len = end - start;
++        wp.mode = UFFDIO_WRITEPROTECT_MODE_WP;
++        if (ioctl(uffd, UFFDIO_WRITEPROTECT, &wp) != 0) {
++            return false;
++        }
++        ++registrations;
++        return true;
++    }
++
++    /// The mapping was (re)created: register it.
++    void OnMap(VAddr start, VAddr end) {
++        std::scoped_lock lk{registry_mutex};
++        Remove(refused, start, end);
++        if (Register(start, end)) {
++            Insert(registered, start, end);
++            low.store(std::min(low.load(), start));
++            high.store(std::max(high.load(), end));
++        } else {
++            Remove(registered, start, end);
++            Insert(refused, start, end);
++        }
++    }
++
++    void OnUnmap(VAddr start, VAddr end) {
++        std::scoped_lock lk{registry_mutex};
++        Remove(registered, start, end);
++        Remove(refused, start, end);
++    }
++
++    /// Whether writes to the page are found by the scan. Memory mapped before the renderer
++    /// existed was never reported to it: its mapping is registered on first use.
++    bool Covers(VAddr page) {
++        std::scoped_lock lk{registry_mutex};
++        if (Contains(registered, page)) {
++            return true;
++        }
++        if (Contains(refused, page)) {
++            return false;
++        }
++#ifdef RYTY_GPU
++        MEMORY_BASIC_INFORMATION info{};
++        if (VirtualQuery(reinterpret_cast<void*>(page), &info, sizeof(info)) == sizeof(info) &&
++            info.State == MEM_COMMIT) {
++            const VAddr start = reinterpret_cast<VAddr>(info.BaseAddress);
++            const VAddr end = start + info.RegionSize;
++            if (Register(start, end)) {
++                Insert(registered, start, end);
++                low.store(std::min(low.load(), start));
++                high.store(std::max(high.load(), end));
++                return true;
++            }
++            Insert(refused, start, end);
++            return false;
++        }
++#endif
++        Insert(refused, page, page + 4096);
++        return false;
++    }
++};
++
++} // namespace
++
++bool WriteScanEnabled() {
++    return WriteScan::Get() != nullptr;
++}
++#else
++bool WriteScanEnabled() {
++    return false;
++}
++#endif
++
+ struct PageManager::Impl {
+     struct PageState {
+         u8 num_write_watchers;
+         u8 num_read_watchers;
+         // PERF-070: guards of GPU writes decoded but not recorded yet (no CPU access at all).
+         u8 num_guards;
++        // PERF-154: writes to the page are found by the write scan; it stays writable.
++        // Decided each time the page gets its first write watcher.
++        u8 scanned;
+ 
+         Core::MemoryPermission WritePerm() const noexcept {
+-            return num_write_watchers == 0 ? Core::MemoryPermission::Write
+-                                           : Core::MemoryPermission::None;
++            return num_write_watchers == 0 || scanned ? Core::MemoryPermission::Write
++                                                      : Core::MemoryPermission::None;
+         }
+ 
+         Core::MemoryPermission ReadPerm() const noexcept {
+@@ -108,14 +287,117 @@ struct PageManager::Impl {
+     virtual ~Impl() = default;
+ 
+     virtual void OnMap(VAddr address, size_t size) {
+-        // No-op
+         EnsurePages(address, address + size);
++#ifdef __linux__
++        if (auto* scan = WriteScan::Get()) {
++            scan->OnMap(address, address + size); // PERF-154
++        }
++#endif
+     }
+ 
+     virtual void OnUnmap(VAddr address, size_t size) {
+-        // No-op
++#ifdef __linux__
++        if (auto* scan = WriteScan::Get()) {
++            scan->OnUnmap(address, address + size); // PERF-154
++        }
++#endif
++    }
++
++    /// PERF-154: whether the write scan finds writes to the page (it then needs no protection).
++    static bool ScannedPage(VAddr page_addr) {
++#ifdef __linux__
++        if (auto* scan = WriteScan::Get()) {
++            return scan->Covers(page_addr);
++        }
++#endif
++        return false;
+     }
+ 
++    /// PERF-154: one PAGEMAP_SCAN over the registered memory; written pages with a write watcher
++    /// go to the caches as their write faults would have.
++    void ScanWrites() {
++#ifdef __linux__
++        auto* scan = WriteScan::Get();
++        if (!scan || !rasterizer) {
++            return;
++        }
++        std::scoped_lock lk{scan->scan_mutex};
++        const VAddr low = scan->low.load();
++        const VAddr high = scan->high.load();
++        if (low >= high) {
++            return;
++        }
++        const auto start_time = std::chrono::steady_clock::now();
++        pm_scan_arg arg{};
++        arg.size = sizeof(arg);
++        arg.flags = PM_SCAN_WP_MATCHING;
++        arg.start = low;
++        arg.end = high;
++        arg.vec = reinterpret_cast<u64>(scan->regions.data());
++        arg.vec_len = scan->regions.size();
++        // Registered memory only: elsewhere every page would count as written.
++        arg.category_mask = PAGE_IS_WRITTEN | PAGE_IS_WPALLOWED;
++        arg.return_mask = PAGE_IS_WRITTEN;
++        while (true) {
++            const long count = ioctl(scan->pagemap, PAGEMAP_SCAN, &arg);
++            if (count < 0) {
++                static std::atomic<u32> logged{};
++                if (logged++ < 10) {
++                    LOG_ERROR(Render, "PERF-154: PAGEMAP_SCAN of {:#x}-{:#x} failed: {}",
++                              arg.start, arg.end, Common::GetLastErrorMsg());
++                }
++                break;
++            }
++            for (long i = 0; i < count; ++i) {
++                ReportWrites(*scan, scan->regions[i].start, scan->regions[i].end);
++            }
++            if (arg.walk_end >= high || count < static_cast<long>(arg.vec_len)) {
++                break;
++            }
++            arg.start = arg.walk_end;
++        }
++        const auto now = std::chrono::steady_clock::now();
++        ++scan->scans;
++        scan->scan_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(now - start_time).count();
++        if (now - scan->window >= std::chrono::seconds{2}) {
++            LOG_WARNING(Render,
++                        "PERF-154: write scans in 2 s: {} taking {:.1f} ms, {} written pages, {} "
++                        "with watchers reported, {} registrations, {} written pages held GPU "
++                        "data",
++                        scan->scans, scan->scan_ns / 1e6, scan->written_pages,
++                        scan->reported_pages, scan->registrations,
++                        rasterizer->GetBufferCache().TakeScannedGpuWrites());
++            scan->scans = scan->scan_ns = scan->written_pages = scan->reported_pages = 0;
++            scan->registrations = 0;
++            scan->window = now;
++        }
++#endif
++    }
++
++#ifdef __linux__
++    void ReportWrites(WriteScan& scan, VAddr start, VAddr end) {
++        VAddr run = 0;
++        const auto flush = [&](VAddr at) {
++            if (run != 0) {
++                scan.reported_pages += (at - run) >> PM_PAGE_BITS;
++                rasterizer->NoteScannedWrite(run, at - run);
++                run = 0;
++            }
++        };
++        for (VAddr address = start; address < end; address += PM_PAGE_SIZE) {
++            ++scan.written_pages;
++            const PageState* state = cached_pages.find(address >> PM_PAGE_BITS);
++            const bool watched = state && state->num_write_watchers != 0 && state->scanned;
++            if (watched && run == 0) {
++                run = address;
++            } else if (!watched) {
++                flush(address);
++            }
++        }
++        flush(end);
++    }
++#endif
++
+     virtual void Protect(VAddr address, size_t size, Core::MemoryPermission perms) = 0;
+ 
+     void EnsurePages(VAddr begin, VAddr end) {
+@@ -238,6 +520,9 @@ struct PageManager::Impl {
+             if (page == page_start) {
+                 perms = old_perms;
+             }
++            if (write_op == PageOp::Track && state->num_write_watchers == 0) {
++                state->scanned = ScannedPage(page << PM_PAGE_BITS); // PERF-154
++            }
+ 
+             // Apply the change to the page state
+             const auto new_perms = state->Update(write_op);
+@@ -313,6 +598,9 @@ struct PageManager::Impl {
+             // Apply the change to the page state
+             const bool update_write = write_op != PageOp::None && write_mask.GetPage(page);
+             const bool update_read = read_op != PageOp::None && read_mask.GetPage(page);
++            if (update_write && write_op == PageOp::Track && state->num_write_watchers == 0) {
++                state->scanned = ScannedPage((base_page + page) << PM_PAGE_BITS); // PERF-154
++            }
+             const auto new_perms = state->Update(write_op, update_write, read_op, update_read);
+ 
+             if (new_perms != perms) [[unlikely]] {
+@@ -762,6 +1050,8 @@ struct SignalImpl : public PageManager::Impl {
+     }
+ };
+ 
++static PageManager* g_scan_manager{}; // PERF-154
++
+ PageManager::PageManager(Vulkan::Rasterizer* rasterizer_) {
+ #ifdef __linux__
+     if (EmulatorSettings.IsUserfaultfdTracking()) {
+@@ -776,9 +1066,29 @@ PageManager::PageManager(Vulkan::Rasterizer* rasterizer_) {
+     LOG_INFO(Config, "Memory tracking method: signals");
+ #endif
+     impl = std::make_unique<SignalImpl>(rasterizer_);
++#ifdef __linux__
++    if (WriteScanEnabled()) {
++        LOG_INFO(Render, "PERF-154: CPU writes to guest memory are found by the write scan");
++    } else if (!WriteScan::Failure().empty()) {
++        LOG_ERROR(Render, "PERF-154: the write scan is unavailable ({}); write faults track "
++                          "guest memory",
++                  WriteScan::Failure());
++    }
++#endif
++    if (WriteScanEnabled()) {
++        g_scan_manager = this;
++        VideoCore::g_write_scan_hook.store([] { g_scan_manager->ScanWrites(); },
++                                           std::memory_order_release);
++    }
+ }
+ 
+-PageManager::~PageManager() = default;
++PageManager::~PageManager() {
++    VideoCore::g_write_scan_hook.store(nullptr, std::memory_order_release);
++}
++
++void PageManager::ScanWrites() {
++    impl->ScanWrites();
++}
+ 
+ u64 PageManager::Guard(VAddr address, u64 size) {
+     return impl->Guard(address, size, true);
+diff --git a/src/video_core/page_manager.h b/src/video_core/page_manager.h
+index 033e1e2e..6e012200 100644
+--- a/src/video_core/page_manager.h
++++ b/src/video_core/page_manager.h
+@@ -18,6 +18,11 @@ namespace VideoCore {
+ struct UffdImpl;
+ struct SignalImpl;
+ 
++/// PERF-154 (Linux, SHADGT_WRITE_SCAN=1): CPU writes to guest memory are found by asking the
++/// kernel which pages were written (userfaultfd asynchronous write protection and PAGEMAP_SCAN)
++/// instead of write-protecting the pages and handling a fault on each first write.
++bool WriteScanEnabled();
++
+ enum class PageOp : s8 {
+     None = 0,
+     Track = 1,
+@@ -61,6 +66,10 @@ public:
+     /// the page is neither write- nor read-protected). Any thread; a racy but word-sized read.
+     bool IsUnwatched(VAddr page) const;
+ 
++    /// PERF-154: reports the CPU writes made to tracked pages since the last scan to the caches,
++    /// as their write faults would have. Any thread; nothing without the write scan.
++    void ScanWrites();
++
+     /// Returns page aligned address.
+     static constexpr VAddr GetPageAddr(VAddr addr) {
+         return Common::AlignDown(addr, PM_PAGE_SIZE);
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index b301a23d..e7de6905 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -5047,6 +5047,14 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks, u64 e
+     return true;
+ }
+ 
++void Rasterizer::NoteScannedWrite(VAddr addr, u64 size) {
++    if (!IsMapped(addr, size)) {
++        return;
++    }
++    buffer_cache.NoteScannedWrite(addr, size);
++    texture_cache.InvalidateMemory(addr, size);
++}
++
+ void Rasterizer::WaitForEarlyFences(VAddr page) {
+     liverpool->WaitForEarlyFences(page);
+ }
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index d3c6308d..6f32bc43 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -226,6 +226,8 @@ public:
+     void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
+     u32 ReadDataFromGds(u32 gsd_offset);
+     /// exact_write_size: bytes a faulting CPU store writes from addr, when known (PERF-011b).
++    /// PERF-154: the CPU wrote these tracked pages (found by the write scan, after the fact).
++    void NoteScannedWrite(VAddr addr, u64 size);
+     bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false,
+                           u64 exact_write_size = 0);
+     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
+-- 
+2.56.0
+

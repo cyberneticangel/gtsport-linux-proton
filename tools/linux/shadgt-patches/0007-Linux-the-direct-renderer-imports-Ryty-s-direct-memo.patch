@@ -1,0 +1,133 @@
+From e22d862a4189311a8adfa881b749de338c3189a3 Mon Sep 17 00:00:00 2001
+From: cyberneticangel <dylan.fantauzzo7@proton.me>
+Date: Mon, 19 Oct 2026 20:37:52 +0200
+Subject: [PATCH 07/12] Linux: the direct renderer imports Ryty's direct-memory
+ aliases
+
+GuestViewBase/GuestViewEnd ask libkernel's RytyDirectMemoryView, and
+MapAlias/UnmapAlias use RytyDirectMemoryMapAlias/UnmapAlias; ImportView
+is no longer Windows-only. With rygt-userptr.so on AMD, GT Sport's boot
+imports its views (5 views, 638 MiB).
+---
+ src/video_core/buffer_cache/direct_memory.cpp | 22 ++++++++++++++-----
+ src/video_core/buffer_cache/proto_import.cpp  | 22 +++++++++++++++++--
+ 2 files changed, 36 insertions(+), 8 deletions(-)
+
+diff --git a/src/video_core/buffer_cache/direct_memory.cpp b/src/video_core/buffer_cache/direct_memory.cpp
+index 38bbe75d..a4d2ab4d 100644
+--- a/src/video_core/buffer_cache/direct_memory.cpp
++++ b/src/video_core/buffer_cache/direct_memory.cpp
+@@ -1,6 +1,9 @@
+ // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#ifndef _WIN32
++#include <dlfcn.h>
++#endif
+ #include <algorithm>
+ #include <array>
+ #include <atomic>
+@@ -35,7 +38,13 @@ MapAliasFn MapAlias() {
+     }();
+     return fn;
+ #else
+-    return nullptr;
++    // Linux: Ryty's libkernel maps a second view of the direct memory's backing file.
++    static const auto fn = [] {
++        void* kernel = dlopen("libkernel.prx", RTLD_LAZY | RTLD_NOLOAD);
++        return kernel ? reinterpret_cast<MapAliasFn>(dlsym(kernel, "RytyDirectMemoryMapAlias_nid_no_patch"))
++                      : nullptr;
++    }();
++    return fn;
+ #endif
+ }
+ 
+@@ -48,7 +57,12 @@ UnmapAliasFn UnmapAlias() {
+     }();
+     return fn;
+ #else
+-    return nullptr;
++    static const auto fn = [] {
++        void* kernel = dlopen("libkernel.prx", RTLD_LAZY | RTLD_NOLOAD);
++        return kernel ? reinterpret_cast<UnmapAliasFn>(dlsym(kernel, "RytyDirectMemoryUnmapAlias_nid_no_patch"))
++                      : nullptr;
++    }();
++    return fn;
+ #endif
+ }
+ 
+@@ -215,7 +229,6 @@ std::optional<std::pair<const Buffer*, u64>> DirectMemory::FindBuffer(VAddr addr
+ }
+ 
+ bool DirectMemory::ImportView(VAddr address) {
+-#ifdef _WIN32
+     const VAddr base = GuestViewBase(address);
+     if (base == 0) {
+         return false;
+@@ -295,9 +308,6 @@ bool DirectMemory::ImportView(VAddr address) {
+                     end - base, views.size(), imported_bytes.load() >> 20);
+     }
+     return true;
+-#else
+-    return false;
+-#endif
+ }
+ 
+ bool DirectMemory::EnsureImported(VAddr address, u64 size) {
+diff --git a/src/video_core/buffer_cache/proto_import.cpp b/src/video_core/buffer_cache/proto_import.cpp
+index 19bddcaf..bb268c64 100644
+--- a/src/video_core/buffer_cache/proto_import.cpp
++++ b/src/video_core/buffer_cache/proto_import.cpp
+@@ -1,6 +1,9 @@
+ // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#ifndef _WIN32
++#include <dlfcn.h>
++#endif
+ #include <cstring>
+ #include <functional>
+ #include <string>
+@@ -537,6 +540,19 @@ void ProtoAliasTest(const Vulkan::Instance& instance, Vulkan::Scheduler& schedul
+ #endif
+ }
+ 
++#ifndef _WIN32
++// Linux: Ryty's libkernel reports the direct-memory view (one backing file's contiguous pages)
++// around an address; the Windows build asks VirtualQuery for the 16 KiB view's allocation.
++static bool LinuxDirectView(VAddr address, u64& begin, u64& end) {
++    using ViewFn = bool (*)(u64, u64*, u64*);
++    static const auto view = [] {
++        void* kernel = dlopen("libkernel.prx", RTLD_LAZY | RTLD_NOLOAD);
++        return kernel ? reinterpret_cast<ViewFn>(dlsym(kernel, "RytyDirectMemoryView_nid_no_patch")) : nullptr;
++    }();
++    return view != nullptr && view(address, &begin, &end);
++}
++#endif
++
+ VAddr GuestViewBase(VAddr address) {
+ #ifdef _WIN32
+     MEMORY_BASIC_INFORMATION mbi{};
+@@ -545,7 +561,8 @@ VAddr GuestViewBase(VAddr address) {
+     }
+     return reinterpret_cast<VAddr>(mbi.AllocationBase);
+ #else
+-    return 0;
++    u64 begin = 0, end = 0;
++    return LinuxDirectView(address, begin, end) ? begin : 0;
+ #endif
+ }
+ 
+@@ -566,7 +583,8 @@ VAddr GuestViewEnd(VAddr base, u64 max_size) {
+     }
+     return end;
+ #else
+-    return 0;
++    u64 begin = 0, end = 0;
++    return LinuxDirectView(base, begin, end) ? std::min<u64>(end, base + max_size) : 0;
+ #endif
+ }
+ 
+-- 
+2.56.0
+

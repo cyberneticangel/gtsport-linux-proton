@@ -1,0 +1,123 @@
+From 2ae4c0027751dc3d2acfb70f037bb412ee4d91c1 Mon Sep 17 00:00:00 2001
+From: cyberneticangel <dylan.fantauzzo7@proton.me>
+Date: Mon, 19 Oct 2026 23:55:18 +0200
+Subject: [PATCH 08/12] Linux: guarded reads go through the renderer's fault
+ handler
+
+On Windows a guarded read is a memcpy under __try: a fault on a page that
+page tracking protected reaches the renderer's handler, which resolves it
+(reading GPU results back first) and the copy completes. The Linux
+version used process_vm_readv, which never faults, so every read of a
+tracked page failed and CopyGuest uploaded zeros: GT Sport's cars had no
+textures and no wheels. Now the copy runs normally under sigsetjmp, and
+only a fault nothing handles leaves it (signals.cpp calls
+EscapeGuardedRead before treating the fault as fatal).
+---
+ ryty_gpu/ryty_core_shims.cpp | 39 +++++++++++++++++++++++++++++++-----
+ src/core/memory.h            |  5 +++++
+ src/core/signals.cpp         |  3 +++
+ 3 files changed, 42 insertions(+), 5 deletions(-)
+
+diff --git a/ryty_gpu/ryty_core_shims.cpp b/ryty_gpu/ryty_core_shims.cpp
+index 548b281c..a6bed06b 100644
+--- a/ryty_gpu/ryty_core_shims.cpp
++++ b/ryty_gpu/ryty_core_shims.cpp
+@@ -4,6 +4,9 @@
+ 
+ #include "ryty_gpu/ryty_diag.h"
+ #include "ryty_gpu/ryty_win32_compat.h"
++#ifndef _WIN32
++#include <csetjmp>
++#endif
+ #ifdef _MSC_VER
+ #include <intrin.h>
+ #else
+@@ -684,6 +687,18 @@ bool IsReadableRange(VAddr virtual_addr, u64 size) {
+ // structured handler below take it), and the caller falls back to the safe copy.
+ thread_local int g_guarded_reads = 0;
+ 
++#ifndef _WIN32
++// The current thread's guarded read (GuardedCopyRaw/GuardedHashRaw below), if any.
++thread_local sigjmp_buf* t_guard{};
++
++void EscapeGuardedRead() {
++    if (sigjmp_buf* guard = t_guard) {
++        t_guard = nullptr;
++        siglongjmp(*guard, 1);
++    }
++}
++#endif
++
+ bool InGuardedRead() {
+     return g_guarded_reads != 0;
+ }
+@@ -760,17 +775,31 @@ static bool GuardedHashRaw(const void* source, size_t size, u64* hash) {
+     return true;
+ }
+ #else
+-// Linux: the kernel copies and reports an inaccessible page as an error (no fault to handle).
++// Linux, as __try/__except on Windows: the copy runs normally, so a fault on a page that page
++// tracking protected goes to the renderer's handler, which resolves it (reading GPU results back
++// first where needed) and the copy goes on. A fault nothing handles (memory the game released or
++// protected) comes back here through EscapeGuardedRead, called by the SIGSEGV handler.
+ static bool GuardedCopyRaw(void* dest, const void* source, size_t size) {
+-    return RytyCompat::SafeCopy(dest, source, size);
++    sigjmp_buf guard;
++    if (sigsetjmp(guard, 1) != 0) {
++        t_guard = nullptr;
++        return false;
++    }
++    t_guard = &guard;
++    g_guarded_copy(dest, source, size);
++    t_guard = nullptr;
++    return true;
+ }
+ 
+ static bool GuardedHashRaw(const void* source, size_t size, u64* hash) {
+-    std::vector<u8> copy(size);
+-    if (!RytyCompat::SafeCopy(copy.data(), source, size)) {
++    sigjmp_buf guard;
++    if (sigsetjmp(guard, 1) != 0) {
++        t_guard = nullptr;
+         return false;
+     }
+-    *hash = g_guarded_hash(copy.data(), size);
++    t_guard = &guard;
++    *hash = g_guarded_hash(source, size);
++    t_guard = nullptr;
+     return true;
+ }
+ #endif
+diff --git a/src/core/memory.h b/src/core/memory.h
+index e6620484..da9adb6d 100644
+--- a/src/core/memory.h
++++ b/src/core/memory.h
+@@ -26,6 +26,11 @@ VAddr MappedAreaEnd(VAddr virtual_addr, VAddr limit = ~VAddr{0});
+ void NoteMappingChange(VAddr address, u64 size);
+ /// A guarded direct read of guest memory is running on this thread (see ryty_core_shims.cpp).
+ bool InGuardedRead();
++#if defined(RYTY_GPU) && !defined(_WIN32)
++/// Inside a guarded read on this thread: leaves it (the copy reports failure). Called by the
++/// SIGSEGV handler for faults nothing handled.
++void EscapeGuardedRead();
++#endif
+ /// Whether page tracking, rather than the game, made the page of address unreadable.
+ bool TrackingMadeUnreadable(VAddr address);
+ /// Mapped and readable for the game (pages page tracking made unreadable still count).
+diff --git a/src/core/signals.cpp b/src/core/signals.cpp
+index a3474770..9d1968b6 100644
+--- a/src/core/signals.cpp
++++ b/src/core/signals.cpp
+@@ -362,6 +362,9 @@ void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
+         const bool is_write = Common::IsWriteError(raw_context);
+         const bool is_exec = Common::IsExecuteError(raw_context);
+         if (!signals->DispatchAccessViolation(raw_context, info->si_addr)) {
++#ifdef RYTY_GPU
++            Core::RytyMemory::EscapeGuardedRead(); // returns only outside a guarded read
++#endif
+             if (thread && thread->DispatchSignal(NativeToOrbisSignal(sig), info_p, context_p)) {
+                 return;
+             }
+-- 
+2.56.0
+

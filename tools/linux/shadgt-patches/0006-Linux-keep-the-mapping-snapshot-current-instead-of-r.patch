@@ -1,0 +1,143 @@
+From 683cfe74feda71c459f113481cd2a96fd3bf100f Mon Sep 17 00:00:00 2001
+From: cyberneticangel <dylan.fantauzzo7@proton.me>
+Date: Mon, 19 Oct 2026 20:13:58 +0200
+Subject: [PATCH 06/12] Linux: keep the mapping snapshot current instead of
+ rereading it
+
+VirtualProtect marked the /proc/self/maps snapshot stale, so after every
+page-tracking protection the next query parsed the whole file again, and
+the snapshot also expired every 100 ms: GT Sport's boot flipped 2 frames a
+second (frames of 0.4-3 s in 'buffers'). Protections made here now update
+the snapshot in place; it is read again only when Ryty reports a mapping
+change (NoteMappingChange) or a lookup misses. 60 fps after the change.
+---
+ ryty_gpu/ryty_core_shims.cpp   |  3 +++
+ ryty_gpu/ryty_win32_compat.cpp | 48 +++++++++++++++++++++++++++++-----
+ ryty_gpu/ryty_win32_compat.h   |  8 +++---
+ 3 files changed, 49 insertions(+), 10 deletions(-)
+
+diff --git a/ryty_gpu/ryty_core_shims.cpp b/ryty_gpu/ryty_core_shims.cpp
+index be5fe530..548b281c 100644
+--- a/ryty_gpu/ryty_core_shims.cpp
++++ b/ryty_gpu/ryty_core_shims.cpp
+@@ -601,6 +601,9 @@ static AreaAnswer LookupAreaWalk(VAddr virtual_addr, VAddr limit) {
+ }
+ 
+ void NoteMappingChange(VAddr address, u64 size) {
++#ifndef _WIN32
++    RytyCompat::MappingsChanged(); // the cached /proc/self/maps snapshot
++#endif
+     DropAliases(address, size); // PERF-080
+     auto& cache = GetAreaCache();
+     const VAddr change_end = address + std::max<u64>(size, 1);
+diff --git a/ryty_gpu/ryty_win32_compat.cpp b/ryty_gpu/ryty_win32_compat.cpp
+index 4f484d39..7ca08498 100644
+--- a/ryty_gpu/ryty_win32_compat.cpp
++++ b/ryty_gpu/ryty_win32_compat.cpp
+@@ -28,9 +28,10 @@ struct Mapping {
+ };
+ 
+ // A sorted snapshot of /proc/self/maps. Reading the file costs about as much as the process has
+-// mappings (GT Sport has tens of thousands), so lookups search the snapshot and it is read again
+-// only after a change made here, when a lookup misses, or when it is older than MaxAgeNs (the
+-// runtime maps and unmaps guest memory without telling the renderer).
++// mappings (GT Sport has thousands), so lookups search the snapshot. Protection changes made here
++// update it in place (page tracking makes thousands a second); it is read again only after a
++// mapping change (VirtualAlloc/VirtualFree here, or Ryty reporting one: RytyGpuMapMemory and the
++// others call MappingsChanged) and when a lookup misses.
+ struct Snapshot {
+     std::mutex mutex;
+     std::vector<Mapping> mappings;
+@@ -38,8 +39,6 @@ struct Snapshot {
+     std::atomic<bool> stale{true};
+ };
+ 
+-constexpr std::uint64_t MaxAgeNs = 100'000'000;
+-
+ Snapshot& GetSnapshot() {
+     static Snapshot snapshot;
+     return snapshot;
+@@ -116,6 +115,42 @@ void MappingsChanged() {
+     GetSnapshot().stale.store(true, std::memory_order_release);
+ }
+ 
++void ProtectionChanged(std::uintptr_t start, std::uintptr_t end, int prot) {
++    auto& snapshot = GetSnapshot();
++    std::scoped_lock lk{snapshot.mutex};
++    if (snapshot.stale.load(std::memory_order_acquire)) {
++        return; // read again anyway
++    }
++    auto& m = snapshot.mappings;
++    // Split the mappings at start and end, then set the protection of those in between.
++    const auto split = [&](std::uintptr_t at) {
++        auto it = std::upper_bound(m.begin(), m.end(), at,
++                                   [](std::uintptr_t a, const Mapping& x) { return a < x.start; });
++        if (it == m.begin()) {
++            return;
++        }
++        --it;
++        if (it->start < at && at < it->end) {
++            Mapping tail = *it;
++            tail.start = at;
++            it->end = at;
++            m.insert(it + 1, tail);
++        }
++    };
++    split(start);
++    split(end);
++    bool covered = false;
++    for (auto it = std::lower_bound(m.begin(), m.end(), start,
++                                    [](const Mapping& x, std::uintptr_t a) { return x.start < a; });
++         it != m.end() && it->start < end; ++it) {
++        it->prot = prot;
++        covered = true;
++    }
++    if (!covered) {
++        snapshot.stale.store(true, std::memory_order_release); // not in the snapshot: read again
++    }
++}
++
+ bool QueryMapping(std::uintptr_t address, MEMORY_BASIC_INFORMATION& info) {
+     constexpr std::uintptr_t UserEnd = 0x0000800000000000ULL;
+     if (address >= UserEnd) {
+@@ -125,8 +160,7 @@ bool QueryMapping(std::uintptr_t address, MEMORY_BASIC_INFORMATION& info) {
+     std::scoped_lock lk{snapshot.mutex};
+     const std::uint64_t now = NowNs();
+     bool fresh = false;
+-    if (snapshot.stale.exchange(false, std::memory_order_acq_rel) ||
+-        now - snapshot.read_at_ns > MaxAgeNs) {
++    if (snapshot.stale.exchange(false, std::memory_order_acq_rel)) {
+         ReadMappings(snapshot.mappings);
+         snapshot.read_at_ns = now;
+         fresh = true;
+diff --git a/ryty_gpu/ryty_win32_compat.h b/ryty_gpu/ryty_win32_compat.h
+index 62e6b956..f32f431c 100644
+--- a/ryty_gpu/ryty_win32_compat.h
++++ b/ryty_gpu/ryty_win32_compat.h
+@@ -81,6 +81,8 @@ namespace RytyCompat {
+ bool QueryMapping(std::uintptr_t address, MEMORY_BASIC_INFORMATION& info);
+ /// Forgets the cached mappings (after the process maps or unmaps memory).
+ void MappingsChanged();
++/// Records in the cached mappings that [start, end) now has protection prot (after mprotect).
++void ProtectionChanged(std::uintptr_t start, std::uintptr_t end, int prot);
+ /// The PROT_* bits for a PAGE_* value, and back.
+ int ProtFromPage(DWORD page);
+ DWORD PageFromProt(int prot);
+@@ -118,11 +120,11 @@ inline BOOL VirtualProtect(LPVOID address, SIZE_T size, DWORD protect, DWORD* ol
+                            ? info.Protect
+                            : PAGE_NOACCESS;
+     }
+-    if (mprotect(reinterpret_cast<void*>(start), end - start, RytyCompat::ProtFromPage(protect)) !=
+-        0) {
++    const int prot = RytyCompat::ProtFromPage(protect);
++    if (mprotect(reinterpret_cast<void*>(start), end - start, prot) != 0) {
+         return FALSE;
+     }
+-    RytyCompat::MappingsChanged();
++    RytyCompat::ProtectionChanged(start, end, prot);
+     return TRUE;
+ }
+ 
+-- 
+2.56.0
+

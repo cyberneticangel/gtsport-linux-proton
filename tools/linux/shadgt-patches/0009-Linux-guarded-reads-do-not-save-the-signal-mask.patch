@@ -1,0 +1,62 @@
+From 3210c632e154e83af89e6c57ab19c99f46ec7b17 Mon Sep 17 00:00:00 2001
+From: cyberneticangel <dylan.fantauzzo7@proton.me>
+Date: Tue, 20 Oct 2026 07:33:43 +0200
+Subject: [PATCH 09/12] Linux: guarded reads do not save the signal mask
+
+sigsetjmp(guard, 1) made a sigprocmask system call per guarded read
+(about 4% of the renderer threads in a race). The escape path unblocks
+SIGSEGV/SIGBUS itself instead.
+---
+ ryty_gpu/ryty_core_shims.cpp | 18 ++++++++++++++++--
+ 1 file changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/ryty_gpu/ryty_core_shims.cpp b/ryty_gpu/ryty_core_shims.cpp
+index a6bed06b..03886ec9 100644
+--- a/ryty_gpu/ryty_core_shims.cpp
++++ b/ryty_gpu/ryty_core_shims.cpp
+@@ -6,6 +6,7 @@
+ #include "ryty_gpu/ryty_win32_compat.h"
+ #ifndef _WIN32
+ #include <csetjmp>
++#include <csignal>
+ #endif
+ #ifdef _MSC_VER
+ #include <intrin.h>
+@@ -779,10 +780,22 @@ static bool GuardedHashRaw(const void* source, size_t size, u64* hash) {
+ // tracking protected goes to the renderer's handler, which resolves it (reading GPU results back
+ // first where needed) and the copy goes on. A fault nothing handles (memory the game released or
+ // protected) comes back here through EscapeGuardedRead, called by the SIGSEGV handler.
++// Leaving the SIGSEGV handler by siglongjmp leaves the signal blocked; the mask is not saved by
++// sigsetjmp (that is a system call per guarded read, and the renderer makes many), so the rare
++// escape unblocks it here.
++static void UnblockFaultSignals() {
++    sigset_t faults;
++    sigemptyset(&faults);
++    sigaddset(&faults, SIGSEGV);
++    sigaddset(&faults, SIGBUS);
++    pthread_sigmask(SIG_UNBLOCK, &faults, nullptr);
++}
++
+ static bool GuardedCopyRaw(void* dest, const void* source, size_t size) {
+     sigjmp_buf guard;
+-    if (sigsetjmp(guard, 1) != 0) {
++    if (sigsetjmp(guard, 0) != 0) {
+         t_guard = nullptr;
++        UnblockFaultSignals();
+         return false;
+     }
+     t_guard = &guard;
+@@ -793,8 +806,9 @@ static bool GuardedCopyRaw(void* dest, const void* source, size_t size) {
+ 
+ static bool GuardedHashRaw(const void* source, size_t size, u64* hash) {
+     sigjmp_buf guard;
+-    if (sigsetjmp(guard, 1) != 0) {
++    if (sigsetjmp(guard, 0) != 0) {
+         t_guard = nullptr;
++        UnblockFaultSignals();
+         return false;
+     }
+     t_guard = &guard;
+-- 
+2.56.0
+
