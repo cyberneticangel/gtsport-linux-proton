@@ -680,9 +680,9 @@ int APS5_VABI sceKernelGettimezone(KernelTimezone* tz) {
 }
 
 uint64_t APS5_VABI sceKernelReadTsc(void) {
-#ifdef _WIN32
+    // The renderer's guest TSC, as the monotonic clocks use: on Linux the raw TSC kept counting
+    // through the renderer's compile pauses while the other clocks skipped them.
     if (const GuestTscFn guestTsc = RendererGuestTsc()) return guestTsc();
-#endif
     if (TimeScale() == 1.0) return __rdtsc();
     static const std::uint64_t origin = __rdtsc();
     return origin + static_cast<std::uint64_t>(static_cast<double>(__rdtsc() - origin) * TimeScale());
