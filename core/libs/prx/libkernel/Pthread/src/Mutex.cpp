@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -166,7 +167,24 @@ int APS5_VABI scePthreadMutexDestroy(PthreadMutex* mutex) {
 int APS5_VABI scePthreadMutexLock(PthreadMutex* mutex) {
     auto* resolved = resolveMutex(mutex, true);
     if (!resolved) return SCE_KERNEL_ERROR_EINVAL;
-    return acquireMutex(resolved, [](auto& native) { native.lock(); return true; }, 0, false);
+    return acquireMutex(resolved, [](auto& native) {
+#ifndef _WIN32
+        // Adaptive spin, as the console's mutexes (and Windows' locks) do: a contended lock
+        // is usually released within a few microseconds, and glibc's mutexes would otherwise
+        // wait and wake through the kernel each time (GT Sport's job threads spent ~20% of a
+        // heavy race in futex wait/wake). RYTY_MUTEX_SPIN=<tries> (0 off, default 200).
+        static const int spins = [] {
+            const char* env = std::getenv("RYTY_MUTEX_SPIN");
+            return env && *env ? std::atoi(env) : 200;
+        }();
+        for (int i = 0; i < spins; ++i) {
+            if (native.try_lock()) return true;
+            __builtin_ia32_pause();
+        }
+#endif
+        native.lock();
+        return true;
+    }, 0, false);
 }
 
 int APS5_VABI scePthreadMutexUnlock(PthreadMutex* mutex) {
