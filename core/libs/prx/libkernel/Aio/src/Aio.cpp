@@ -70,7 +70,10 @@ std::int64_t NativePread(std::int32_t fd, void* buf, std::size_t nbyte, std::int
     errno = error;
     return result;
 #else
-    return static_cast<std::int64_t>(::pread(fd, buf, nbyte, static_cast<off_t>(offset)));
+    // See Stdio.cpp's NativePread: the renderer's write protection must go first.
+    return ReadIntoGuest(buf, nbyte, [&](void* target) -> std::int64_t {
+        return static_cast<std::int64_t>(::pread(fd, target, nbyte, static_cast<off_t>(offset)));
+    });
 #endif
 }
 

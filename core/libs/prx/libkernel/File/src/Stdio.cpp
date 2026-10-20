@@ -119,7 +119,13 @@ static int NativeFlock(int descriptor, int operation) {
     return ::flock(descriptor, operation);
 }
 static std::int64_t NativePread(int descriptor, void* buf, std::size_t nbytes, std::int64_t offset) {
-    return static_cast<std::int64_t>(::pread(descriptor, buf, nbytes, static_cast<off_t>(offset)));
+    // As on Windows: the kernel's write into a page the renderer write-protected fails (EFAULT or
+    // a short read) instead of faulting, and the renderer must learn the bytes changed. Without
+    // this GT Sport's streamed textures and meshes arrived partly or not at all (blocky liveries,
+    // missing wheels and hands, stretched track triangles).
+    return ReadIntoGuest(buf, nbytes, [&](void* target) -> std::int64_t {
+        return static_cast<std::int64_t>(::pread(descriptor, target, nbytes, static_cast<off_t>(offset)));
+    });
 }
 static std::int64_t NativePwrite(int descriptor, const void* buf, std::size_t nbytes, std::int64_t offset) {
     return static_cast<std::int64_t>(::pwrite(descriptor, buf, nbytes, static_cast<off_t>(offset)));
