@@ -118,6 +118,9 @@ void PrepareGuestWrite(void* buffer, std::size_t bytes) {
     }
     if (invalidate != nullptr && buffer != nullptr && bytes != 0) invalidate(reinterpret_cast<std::uint64_t>(buffer), bytes);
 #else
+    // APS5_READ_PREPARE=0: reads into guest memory without telling the renderer (measurements).
+    static const bool prepare = [] { const char* env = std::getenv("APS5_READ_PREPARE"); return !env || env[0] != '0'; }();
+    if (!prepare) return;
     using RangeFunction = void (*)(std::uint64_t, std::uint64_t);
     static const auto invalidate = reinterpret_cast<RangeFunction>(RendererSymbol("RytyGpuInvalidateMemory"));
     if (invalidate != nullptr && buffer != nullptr && bytes != 0) invalidate(reinterpret_cast<std::uint64_t>(buffer), bytes);

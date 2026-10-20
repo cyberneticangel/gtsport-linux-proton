@@ -168,6 +168,8 @@ private:
         // host heap at 47-bit addresses, outside both. libkernel places the game's other mappings
         // elsewhere in the arena (searching /proc/self/maps), so the window is checked page by
         // page as it is used.
+        // APS5_HEAP_ARENA=0: the host heap as before (for measurements).
+        if (const char* env = std::getenv("APS5_HEAP_ARENA"); env && env[0] == '0') return;
         _base = InteropStart;
         _end = InteropEnd;
 #endif
